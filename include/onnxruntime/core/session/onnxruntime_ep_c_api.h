@@ -2767,7 +2767,10 @@ struct OrtEp {
    *   the initializer data as inputs to the compiled/fused node. The EP accesses these initializers at Compute()
    *   time via KernelContext_GetInput().
    * - EP-managed: the EP sets drop_constant_initializers to true, keeps references to the initializers in its
-   *   EPContext data, and loads the data itself when a session is created from the compiled model. The data is
+   *   EPContext data, and loads the data itself when a session is created from the compiled model. The EP can only
+   *   keep references to initializers that the source model provides; OrtApi::ValueInfo_GetSourceModelLocation()
+   *   tells which ones (see OrtInitializerSourceModelLocation). It must embed the others, e.g., initializers created
+   *   by constant folding or the layout transformation. The data is
    *   located via the "session.model_external_initializers_file_folder_path" and, for OrtWeightlessSupport_ALL,
    *   "ep.context_source_model_path" session options.
    *

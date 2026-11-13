@@ -847,6 +847,43 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   bool GetExternalInitializerInfo(const std::string& name, std::unique_ptr<ExternalDataInfo>& ext_info,
                                   bool check_outer_scope = false) const;
 
+#if !defined(ORT_MINIMAL_BUILD)
+  /// <summary>
+  /// Checks whether an initializer holds the data it had in the model this Graph was loaded from, i.e., whether it
+  /// is one of the initializers listed in the model's GraphProto and hasn't been removed or replaced since. Returns
+  /// false for initializers that ORT created after loading, e.g., by constant folding or other graph optimizations,
+  /// or that it rewrote, e.g., the initializers the layout transformation transposes. Initializers created from
+  /// 'Constant' nodes or sparse initializers of the model are not listed in its GraphProto's initializers either.
+  /// </summary>
+  /// <param name="name">The initializer's name.</param>
+  /// <param name="check_outer_scope">Set to true if parent graphs should be checked.</param>
+  bool IsInitializerFromModel(const std::string& name, bool check_outer_scope = false) const;
+
+  /// <summary>
+  /// Checks whether an initializer is from the model this Graph was loaded from (see IsInitializerFromModel()) and its
+  /// data was stored outside the model's GraphProto there: in an external data file, or in memory provided by the
+  /// application when the model was created with the OrtModelEditorApi. Returns true even if the application provides
+  /// the external data files in memory (AddExternalInitializersFromFilesInMemory), since they are the model's files.
+  /// </summary>
+  /// <param name="name">The initializer's name.</param>
+  /// <param name="check_outer_scope">Set to true if parent graphs should be checked.</param>
+  bool IsExternalInitializerFromModel(const std::string& name, bool check_outer_scope = false) const;
+
+  /// <summary>
+  /// Gets the location (file path, file offset, byte size) of an initializer's data as declared in the external data
+  /// entries of the model this Graph was loaded from. Unlike GetExternalInitializerInfo(), which describes where the
+  /// data is now, this keeps returning the declared location after the data was replaced with the same data in memory
+  /// (AddExternalInitializersFromFilesInMemory).
+  /// </summary>
+  /// <param name="name">The initializer's name.</param>
+  /// <param name="ext_info">Output parameter set to the declared location.</param>
+  /// <param name="check_outer_scope">Set to true if parent graphs should be checked.</param>
+  /// <returns>True if `name` is an external initializer of the model (see IsExternalInitializerFromModel()) whose data
+  /// the model declared in an external data file. Otherwise, returns false.</returns>
+  bool GetSourceModelExternalDataInfo(const std::string& name, std::unique_ptr<ExternalDataInfo>& ext_info,
+                                      bool check_outer_scope = false) const;
+#endif  // !defined(ORT_MINIMAL_BUILD)
+
   /** Gets all the initializer tensors in this Graph. */
   const InitializedTensorSet& GetAllInitializedTensors() const noexcept { return name_to_initial_tensor_; }
 
@@ -2065,6 +2102,28 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   ONNX_NAMESPACE::GraphProto deserialized_proto_data_;
 
   InitializedTensorSet name_to_initial_tensor_;
+
+#if !defined(ORT_MINIMAL_BUILD)
+  // Names of the initializers listed in the GraphProto this Graph was created from that still hold their original
+  // data. A name is removed when the initializer is removed, since an initializer added later under the same name
+  // (e.g., by the layout transformation) holds different data. See IsInitializerFromModel().
+  InlinedHashSet<std::string> model_initializer_names_;
+
+  // Where the model declared the data of the initializers in model_initializer_names_ that it stored outside its
+  // GraphProto, by name. See IsExternalInitializerFromModel() and GetSourceModelExternalDataInfo().
+  // Only the fields that the OrtExternalInitializerInfo accessors expose are kept, and each declared file path is
+  // stored once in model_external_data_paths_, since a model's external initializers usually share a few files.
+  struct ModelExternalDataLocation {
+    // Index into model_external_data_paths_, or kNoDeclaredFile if the model didn't declare a file (data provided
+    // in memory with the OrtModelEditorApi, or external data entries that can't be parsed).
+    uint32_t path_index;
+    int64_t offset;
+    size_t length;
+  };
+  static constexpr uint32_t kNoDeclaredFile = std::numeric_limits<uint32_t>::max();
+  InlinedHashMap<std::string, ModelExternalDataLocation> model_external_data_locations_;
+  InlinedVector<PathString> model_external_data_paths_;
+#endif  // !defined(ORT_MINIMAL_BUILD)
 
   // Initializers that are external to the Graph.
   // e.g. created from existing memory using CreateTensorWithDataAndDeleterAsOrtValue in the ORT API.

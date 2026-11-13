@@ -2065,6 +2065,124 @@ void SetTensorProtoExternalData(const std::string& key, const std::string& value
 }
 }  // namespace
 
+// Test that a Graph tracks which initializers come from the model it was loaded from, and which of them were stored in
+// external data files, also after their external data is replaced with data in memory.
+TEST_F(GraphTest, InitializersFromModel) {
+  constexpr int64_t kNumElements = 64;  // Larger than utils::kSmallTensorExternalDataThreshold.
+
+  ONNX_NAMESPACE::ModelProto model_proto;
+  model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+  auto* opset = model_proto.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(13);
+  auto* graph_proto = model_proto.mutable_graph();
+  graph_proto->set_name("graph");
+
+  // Y = Add(internal, external), with both initializers stored in the model.
+  for (const char* name : {"internal", "external"}) {
+    auto* initializer = graph_proto->add_initializer();
+    initializer->set_name(name);
+    initializer->set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+    initializer->add_dims(kNumElements);
+    if (std::string(name) == "internal") {
+      for (int64_t i = 0; i < kNumElements; ++i) {
+        initializer->add_int32_data(static_cast<int32_t>(i));
+      }
+    } else {
+      // The data file is not read in this test.
+      initializer->set_data_location(ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL);
+      SetTensorProtoExternalData("location", "external_data.bin", *initializer);
+      SetTensorProtoExternalData("offset", "0", *initializer);
+      SetTensorProtoExternalData("length", std::to_string(kNumElements * sizeof(int32_t)), *initializer);
+    }
+  }
+  auto* add = graph_proto->add_node();
+  add->set_op_type("Add");
+  add->add_input("internal");
+  add->add_input("external");
+  add->add_output("Y");
+  auto* output = graph_proto->add_output();
+  output->set_name("Y");
+  output->mutable_type()->mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+
+  std::shared_ptr<Model> model;
+  ASSERT_STATUS_OK(Model::Load(std::move(model_proto), model, nullptr, *logger_));
+  Graph& graph = model->MainGraph();
+
+  EXPECT_TRUE(graph.IsInitializerFromModel("internal"));
+  EXPECT_FALSE(graph.IsExternalInitializerFromModel("internal"));
+  EXPECT_TRUE(graph.IsInitializerFromModel("external"));
+  EXPECT_TRUE(graph.IsExternalInitializerFromModel("external"));
+  EXPECT_FALSE(graph.IsInitializerFromModel("Y"));
+
+  // The external data is replaced with the application's data (AddExternalInitializers), which is not guaranteed to
+  // match the model's: the initializer is no longer one of the model's initializers.
+  std::vector<int32_t> data(kNumElements, 1);
+  OrtValue ort_value;
+  Tensor::InitOrtValue(DataTypeImpl::GetType<int32_t>(), TensorShape{kNumElements}, data.data(),
+                       OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator), ort_value);
+  ASSERT_STATUS_OK(graph.InjectExternalInitializedTensors({{"external", ort_value}}));
+  const TensorProto* external = nullptr;
+  ASSERT_TRUE(graph.GetInitializedTensor("external", external));
+  ASSERT_NE(external, nullptr);
+  EXPECT_FALSE(utils::HasExternalDataInFile(*external));
+  EXPECT_FALSE(graph.IsInitializerFromModel("external"));
+  EXPECT_FALSE(graph.IsExternalInitializerFromModel("external"));
+
+  // An initializer that ORT removes and adds again under the same name, as the layout transformation does when it
+  // transposes an initializer, doesn't hold the model's data anymore.
+  const TensorProto* internal = nullptr;
+  ASSERT_TRUE(graph.GetInitializedTensor("internal", internal));
+  ASSERT_NE(internal, nullptr);
+  const ONNX_NAMESPACE::TensorProto internal_copy = *internal;
+  graph.RemoveInitializedTensor("internal");
+  graph.AddInitializedTensor(internal_copy);
+  EXPECT_FALSE(graph.IsInitializerFromModel("internal"));
+  EXPECT_FALSE(graph.IsExternalInitializerFromModel("internal"));
+}
+
+// Test that the initializers of a model created with the OrtModelEditorApi are tracked as the model's initializers,
+// with the ones whose data the application provides as external tracked as external.
+TEST_F(GraphTest, InitializersFromModelEditorApiModel) {
+  ModelEditorGraph editor_graph;
+  const TensorShape shape{2};
+  auto make_value_info = [&](const char* name) {
+    auto value_info = std::make_unique<ModelEditorValueInfo>();
+    value_info->name = name;
+    value_info->type_info = std::make_unique<OrtTypeInfo>(
+        ONNX_TYPE_TENSOR,
+        OrtTensorTypeAndShapeInfo::GetTensorShapeAndTypeHelper(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &shape, nullptr));
+    return std::unique_ptr<ModelEditorValueInfo, OrtValueInfoDeleter>(value_info.release());
+  };
+  // The initializers are graph outputs, so that they are used.
+  editor_graph.outputs.push_back(make_value_info("internal"));
+  editor_graph.outputs.push_back(make_value_info("external"));
+
+  std::vector<float> external_data{1.0f, 2.0f};
+  auto make_ort_value = [&](bool is_external) {
+    auto ort_value = std::make_unique<OrtValue>();
+    if (is_external) {
+      Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), shape, external_data.data(),
+                           OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator), *ort_value);
+    } else {
+      Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), shape, CPUAllocator::DefaultInstance(), *ort_value);
+    }
+    return std::unique_ptr<OrtValue, OrtValueDeleter>(ort_value.release());
+  };
+  editor_graph.initializers.emplace("internal", make_ort_value(false));
+  editor_graph.external_initializers.emplace("external", make_ort_value(true));
+
+  Model model("model_editor_initializers", false, *logger_);
+  std::unique_ptr<Graph> graph;
+  ASSERT_STATUS_OK(Graph::LoadFromModelEditorApiModel(editor_graph, model, model.MainGraph().DomainToVersionMap(),
+                                                      nullptr, false, *logger_, graph));
+
+  EXPECT_TRUE(graph->IsInitializerFromModel("internal"));
+  EXPECT_FALSE(graph->IsExternalInitializerFromModel("internal"));
+  EXPECT_TRUE(graph->IsInitializerFromModel("external"));
+  EXPECT_TRUE(graph->IsExternalInitializerFromModel("external"));
+}
+
 TEST_F(GraphTest, InjectExternalInitializedTensors) {
   const std::string initializer_name = "test_external_initializer";
 

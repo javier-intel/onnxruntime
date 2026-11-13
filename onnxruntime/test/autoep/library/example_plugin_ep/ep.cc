@@ -282,13 +282,16 @@ bool ExampleEp::DropsConstantInitializers() const {
 
 OrtStatus* ExampleEp::TrySaveConstantInitializer(Ort::ConstValueInfo maybe_initializer) {
   EXCEPTION_TO_RETURNED_STATUS_BEGIN
-  bool copy = maybe_initializer.IsConstantInitializer() && config_.weightless_mode != OrtWeightlessSupport_ALL;
+  bool copy = maybe_initializer.IsConstantInitializer();
 
-  if (copy && config_.weightless_mode == OrtWeightlessSupport_EXTERNAL_ONLY) {
-    // Weightless for external initializers only: copy the initializer only if its data is inside the ONNX model.
-    Ort::ExternalInitializerInfo external_info{nullptr};
-    RETURN_IF_ERROR(maybe_initializer.GetExternalInitializerInfo(external_info));
-    copy = external_info == nullptr;
+  if (copy && config_.weightless_mode != OrtWeightlessSupport_NONE) {
+    // In weightless mode, copy only the initializers the EP can't keep references to: those not in the source model
+    // (e.g., created by constant folding), and in OrtWeightlessSupport_EXTERNAL_ONLY mode, the internal ones.
+    const OrtInitializerSourceModelLocation location = maybe_initializer.GetSourceModelLocation();
+    const bool can_reference = location == OrtInitializerSourceModelLocation_EXTERNAL ||
+                               (location == OrtInitializerSourceModelLocation_INTERNAL &&
+                                config_.weightless_mode == OrtWeightlessSupport_ALL);
+    copy = !can_reference;
   }
 
   if (copy) {

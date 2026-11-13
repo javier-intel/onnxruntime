@@ -3982,6 +3982,22 @@ inline bool ConstValueInfoImpl<T>::IsConstantInitializer() const {
 }
 
 template <typename T>
+inline OrtInitializerSourceModelLocation ConstValueInfoImpl<T>::GetSourceModelLocation() const {
+  OrtInitializerSourceModelLocation out = OrtInitializerSourceModelLocation_NONE;
+  ThrowOnError(GetApi().ValueInfo_GetSourceModelLocation(this->p_, &out));
+  return out;
+}
+
+template <typename T>
+inline Status ConstValueInfoImpl<T>::GetSourceModelExternalDataInfo(ExternalInitializerInfo& info) const {
+  OrtExternalInitializerInfo* out = nullptr;
+  auto status = Status(GetApi().ValueInfo_GetSourceModelExternalDataInfo(this->p_, &out));
+  if (!status.IsOK()) return status;
+  info = ExternalInitializerInfo{out};
+  return status;
+}
+
+template <typename T>
 inline bool ConstValueInfoImpl<T>::IsFromOuterScope() const {
   bool out = false;
   ThrowOnError(GetApi().ValueInfo_IsFromOuterScope(this->p_, &out));

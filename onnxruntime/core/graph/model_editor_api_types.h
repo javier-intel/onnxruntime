@@ -74,6 +74,17 @@ struct ModelEditorValueInfo : public OrtValueInfo {
                            "for a OrtValueInfo");
   }
 
+  Status GetSourceModelLocation(OrtInitializerSourceModelLocation& /*location*/) const override {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
+                           "OrtModelEditorApi does not support getting the source model location for a OrtValueInfo");
+  }
+
+  Status GetSourceModelExternalDataInfo(std::unique_ptr<onnxruntime::ExternalDataInfo>& /*ext_info*/) const override {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
+                           "OrtModelEditorApi does not support getting the source model external data information ",
+                           "for a OrtValueInfo");
+  }
+
   Status IsRequiredGraphInput(bool& /*is_required_graph_input*/) const override {
     return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
                            "OrtModelEditorApi does not support querying if a graph input is required for OrtValueInfo");

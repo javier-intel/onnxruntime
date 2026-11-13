@@ -69,6 +69,12 @@ struct EpValueInfo : public OrtValueInfo {
   // Otherwise, sets the output parameter `ext_info` to nullptr (not an error).
   Status GetExternalInitializerInfo(std::unique_ptr<onnxruntime::ExternalDataInfo>& ext_info) const override;
 
+  // Gets where the source model stored this initializer's data.
+  Status GetSourceModelLocation(OrtInitializerSourceModelLocation& location) const override;
+
+  // Gets the location of this initializer's data as declared in the source model's external data entries.
+  Status GetSourceModelExternalDataInfo(std::unique_ptr<onnxruntime::ExternalDataInfo>& ext_info) const override;
+
   // Check if this value is a required graph input.
   Status IsRequiredGraphInput(bool& is_required_graph_input) const override;
 

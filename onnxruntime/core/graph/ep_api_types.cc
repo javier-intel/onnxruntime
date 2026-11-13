@@ -516,6 +516,52 @@ Status EpValueInfo::GetExternalInitializerInfo(std::unique_ptr<ExternalDataInfo>
   return Status::OK();
 }
 
+Status EpValueInfo::GetSourceModelLocation(OrtInitializerSourceModelLocation& location) const {
+#if !defined(ORT_MINIMAL_BUILD)
+  location = OrtInitializerSourceModelLocation_NONE;
+  if (!IsFlagSet(kIsConstantInitializer) && !IsFlagSet(kIsOptionalGraphInput)) {
+    return Status::OK();
+  }
+
+  ORT_RETURN_IF(graph_ == nullptr, "Unable to get the source model location for value named '", name_,
+                "': parent graph is NULL");
+
+  const onnxruntime::Graph& graph = graph_->GetGraphViewer().GetGraph();
+  if (graph.IsExternalInitializerFromModel(name_, /*check_outer_scope*/ true)) {
+    location = OrtInitializerSourceModelLocation_EXTERNAL;
+  } else if (graph.IsInitializerFromModel(name_, /*check_outer_scope*/ true)) {
+    location = OrtInitializerSourceModelLocation_INTERNAL;
+  }
+
+  return Status::OK();
+#else
+  ORT_UNUSED_PARAMETER(location);
+  return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "Not supported in this build");
+#endif  // !defined(ORT_MINIMAL_BUILD)
+}
+
+Status EpValueInfo::GetSourceModelExternalDataInfo(std::unique_ptr<ExternalDataInfo>& result) const {
+#if !defined(ORT_MINIMAL_BUILD)
+  result = nullptr;
+  if (!IsFlagSet(kIsConstantInitializer) && !IsFlagSet(kIsOptionalGraphInput)) {
+    return Status::OK();
+  }
+
+  ORT_RETURN_IF(graph_ == nullptr, "Unable to get the source model external data information for value named '",
+                name_, "': parent graph is NULL");
+
+  const onnxruntime::Graph& graph = graph_->GetGraphViewer().GetGraph();
+  if (!graph.GetSourceModelExternalDataInfo(name_, result, /*check_outer_scope*/ true)) {
+    result = nullptr;
+  }
+
+  return Status::OK();
+#else
+  ORT_UNUSED_PARAMETER(result);
+  return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED, "Not supported in this build");
+#endif  // !defined(ORT_MINIMAL_BUILD)
+}
+
 Status EpValueInfo::IsRequiredGraphInput(bool& is_required_graph_input) const {
   is_required_graph_input = IsFlagSet(Flags::kIsRequiredGraphInput);
   return Status::OK();

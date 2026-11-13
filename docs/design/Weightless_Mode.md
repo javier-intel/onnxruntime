@@ -221,6 +221,7 @@ earlier version that reports `"weightless_support"` = `"all"` therefore works wi
 | `GetWeightlessSupport()` differs from the weightless EP metadata of a device | Warning (see [1.4](#1-ep-reports-its-supported-modes)). |
 | EP built against an API older than 29 | No `GetWeightlessSupport` check. ORT logs an INFO message and lets the EP handle the request. |
 | Compiling in `ALL` mode with ORT-provided internal initializers and no initializer location function | Warning: the internal initializers are copied into the compiled model and can't be shared by model variants (see [4.1](#41-where-the-weights-are-stored)). |
+| Compiling in `ALL` mode with EP-managed initializers that ORT created or rewrote after loading the source model (e.g., by constant folding or the layout transformation) | Warning: they aren't in the source model, so the EP must embed them (see [4.1](#41-where-the-weights-are-stored)). They aren't recorded as a `"source_model"` dependency. |
 | Session created from a model whose `"external_dependencies"` include `"source_model"` (or, for models without that entry, with `"weightless_mode"` = `"2"`) without `"ep.context_source_model_path"` or a source model buffer | Warning. An EP that needs the source model may still find it through `"onnx_model_filename"` (see [4.2](#42-requirements-per-mode)). |
 
 The deprecated `"ep.enable_weightless"` = `"1"` (and `SetWeightlessEnabled(true)`, which sets it) still works when
@@ -264,6 +265,59 @@ The EP's references point to the source model's data:
 
 An application generally can't tell which strategy an EP uses, so it should follow the requirements in 4.2,
 which cover both.
+
+**Initializers created at compile time.** The initializers the compiled nodes consume aren't necessarily the ones
+in the source model. Before the EP compiles the graph, ORT can create new initializers, e.g., by constant folding
+or other graph optimizations, or rewrite existing ones, e.g., when the layout transformation for an EP that prefers
+NHWC transposes weights. The source model doesn't contain these initializers, so weightless mode can't apply to
+them:
+
+- With ORT-provided initializers, ORT copies them into the compiled model like any other initializer it provides
+  (into the external initializers file if one is set). The model works, but they can't be shared between variants.
+- With EP-managed initializers, they can't be resolved from the source model at runtime. In `ALL` mode the EP
+  must embed them in its EPContext data instead of keeping references to them. In `EXTERNAL_ONLY` mode the EP
+  copies them anyway, since they aren't external data.
+
+ORT tracks which initializers still hold the data they had in the source model (their provenance), and where the
+source model stored them. ORT uses the same information to resolve `"external_dependencies"`. In `ALL` mode, ORT logs
+a warning when an EP obtains initializers itself that aren't in the source model, and doesn't record them as a
+`"source_model"` dependency. To keep the compiled initializers identical to the source model, compile with graph
+optimizations disabled (`GraphOptimizationLevel::ORT_DISABLE_ALL`). That doesn't prevent the transformations an EP
+depends on, such as the layout transformation.
+
+**Initializer provenance.** EPs query it with `OrtApi::ValueInfo_GetSourceModelLocation()`, which returns an
+`OrtInitializerSourceModelLocation`:
+
+| Initializer | `ValueInfo_GetSourceModelLocation()` | `ValueInfo_GetSourceModelExternalDataInfo()` | `ValueInfo_GetExternalInitializerInfo()` |
+|---|---|---|---|
+| Stored in an external data file of the source model | `_EXTERNAL` | Declared file, offset, length | Same as declared |
+| Same, with the files provided in memory (`AddExternalInitializersFromFilesInMemory`) | `_EXTERNAL` | Declared file, offset, length | NULL (data in memory) |
+| Stored inside the source model's `.onnx` | `_INTERNAL` | NULL | NULL |
+| Created from a `Constant` node of the source model | `_NONE` | NULL | NULL |
+| Data replaced with `AddExternalInitializers` | `_NONE` | NULL | NULL (data in memory) |
+| Added as external data with the `OrtModelEditorApi` (application memory) | `_EXTERNAL` | NULL (no declared file) | NULL |
+| Added as internal data with the `OrtModelEditorApi` | `_INTERNAL` | NULL | NULL |
+| Created or rewritten by ORT (constant folding, layout transformation, ...) | `_NONE` | NULL | Current location, if any |
+
+`Constant` nodes are `_NONE` because the source model stores their data in node attributes, not in initializers.
+Reporting them as `_INTERNAL` later would be an ORT-only change, with no API change; EPs referencing them would then
+have to resolve their data from the source model's `Constant` nodes.
+
+**Which query to use.** `ValueInfo_GetSourceModelExternalDataInfo()` returns the location the source model declares,
+for referencing the source model's weights, e.g., leaving an initializer out of a compiled binary and resolving it
+from the source model when the binary is imported. `ValueInfo_GetExternalInitializerInfo()` returns where the data
+is in this session, for reading or memory-mapping it now; it may be NULL, e.g., when the data files are provided in
+memory. The declared file path is the source model's `location` entry, relative to the source model's directory.
+
+**Weightless contract.** For an EP that obtains the initializer data itself:
+
+- `_EXTERNAL` initializers can be referenced in `EXTERNAL_ONLY` and `ALL` modes, and `_INTERNAL` initializers in
+  `ALL` mode. `_NONE` initializers must always be embedded, so a compiled partition can be partly weightless.
+- Referenced data must be byte-identical when the compiled model is imported. The same source model, with the same
+  initializer names and data, must be available at compile time and at import.
+- Data supplied with `AddExternalInitializers` is not weightless: ORT doesn't know whether it matches the source
+  model, so it's `_NONE`. Supply the source model's own external data files with
+  `AddExternalInitializersFromFilesInMemory` instead.
 
 ### 4.2 Requirements per mode
 
@@ -384,3 +438,8 @@ inside the variant directory under that name.
 3. **Metadata and `GetWeightlessSupport` consistency is only checked when weightless mode is requested.**
    `GetWeightlessSupport()` is only called then, so an inconsistent EP goes unnoticed until an application
    requests a mode.
+4. **Initializers created at compile time can't be weightless.** Initializers that ORT creates or rewrites before
+   the EP compiles the graph (see [4.1](#41-where-the-weights-are-stored)) aren't in the source model. ORT only
+   warns about them in `ALL` mode, for EP-managed initializers; it can't check whether the EP embeds them or keeps
+   references that fail at runtime. Initializers that ORT creates from `Constant` nodes or sparse initializers of
+   the source model are treated the same way, since the source model doesn't list them as initializers.

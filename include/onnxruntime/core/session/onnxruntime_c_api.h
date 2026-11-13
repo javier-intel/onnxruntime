@@ -1368,6 +1368,40 @@ typedef struct OrtEnvCreationOptions {
 
 } OrtEnvCreationOptions;
 
+/**
+ * \brief Where an initializer's data was stored in the model the session was created from (the source model).
+ *
+ * Returned by OrtApi::ValueInfo_GetSourceModelLocation(). An EP in weightless mode can use it to determine which
+ * initializers it can keep references to instead of embedding their data in its compiled binary or EPContext data:
+ * - OrtWeightlessSupport_EXTERNAL_ONLY: initializers with OrtInitializerSourceModelLocation_EXTERNAL.
+ * - OrtWeightlessSupport_ALL: initializers with OrtInitializerSourceModelLocation_EXTERNAL or
+ *   OrtInitializerSourceModelLocation_INTERNAL.
+ * Initializers with OrtInitializerSourceModelLocation_NONE must always be embedded, since the source model doesn't
+ * provide their data.
+ *
+ * \note Future versions may add values. EPs should handle values they don't recognize like
+ *       OrtInitializerSourceModelLocation_NONE.
+ *
+ * \since Version 1.32.
+ */
+typedef enum OrtInitializerSourceModelLocation {
+  /** Not an initializer from the source model: not an initializer, or an initializer that ORT created or rewrote after
+   *  loading the source model (e.g., by constant folding or the layout transformation), an initializer created from a
+   *  'Constant' node or a sparse initializer of the source model, or an initializer whose data the application
+   *  replaced via AddExternalInitializers, since that data is not guaranteed to match the source model's. */
+  OrtInitializerSourceModelLocation_NONE = 0,
+
+  /** An initializer stored inside the source model's ONNX file. */
+  OrtInitializerSourceModelLocation_INTERNAL = 1,
+
+  /** An initializer stored outside the source model's ONNX file: in an external data file of the source model,
+   *  including when the application provides the source model's external data files in memory
+   *  (AddExternalInitializersFromFilesInMemory), or in application memory for initializers that the application adds
+   *  as external data with the OrtModelEditorApi. ValueInfo_GetExternalInitializerInfo() returns NULL for data in
+   *  memory; ValueInfo_GetSourceModelExternalDataInfo() returns the location the source model declares, if any. */
+  OrtInitializerSourceModelLocation_EXTERNAL = 2,
+} OrtInitializerSourceModelLocation;
+
 /** \brief The C API
  *
  * All C API functions are defined inside this structure as pointers to functions.
@@ -4174,6 +4208,11 @@ struct OrtApi {
    * After session creation completes, non-owning buffers that were copied can be deallocated. The supplied OrtValue(s)
    * and SessionOptions instance can be destroyed even when buffers are borrowed; the underlying borrowed buffers must
    * still satisfy the lifetime requirement above.
+   *
+   * \note The supplied data is not guaranteed to match the model's, so the replaced initializers are not treated as
+   *       data from the source model: ValueInfo_GetSourceModelLocation() reports OrtInitializerSourceModelLocation_NONE
+   *       for them, and they are not weightless. To provide the model's own external data files in memory, use
+   *       AddExternalInitializersFromFilesInMemory instead.
    *
    * \param[in] options
    * \param[in] initializer_names Array of null terminated UTF-8 encoded strings of the initializers names.
@@ -7768,6 +7807,65 @@ struct OrtApi {
   ORT_API2_STATUS(EpDevice_GetMemoryCapacity, _In_ const OrtEpDevice* ep_device,
                   _In_ OrtDeviceMemoryType memory_type,
                   _Out_opt_ uint64_t* total_memory_bytes, _Out_opt_ uint64_t* available_memory_bytes);
+
+  /** \brief Get where an initializer's data was stored in the model the session was created from (the source model).
+   *
+   * Unlike ValueInfo_GetExternalInitializerInfo(), which describes where the initializer's data is now, this describes
+   * the source model. An initializer that ORT created or rewrote after loading the source model (e.g., by constant
+   * folding or the layout transformation), or whose data the application replaced via AddExternalInitializers, is not
+   * in the source model, and an external initializer whose data file the application provided in memory
+   * (AddExternalInitializersFromFilesInMemory) is still external. Use ValueInfo_GetSourceModelExternalDataInfo() to
+   * get the location the source model declares for an external initializer. In weightless mode, an EP can use this to
+   * determine which initializers it can keep references to instead of embedding them; see
+   * OrtInitializerSourceModelLocation.
+   *
+   * Supports initializers defined in an outer scope (i.e., a parent graph).
+   *
+   * \param[in] value_info The OrtValueInfo instance.
+   * \param[out] location Output parameter set to OrtInitializerSourceModelLocation_NONE if the value is not an
+   *                      initializer from the source model, or to where the source model stored its data.
+   *
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \note Returns ORT_NOT_IMPLEMENTED in minimal builds.
+   *
+   * \since Version 1.32.
+   */
+  ORT_API2_STATUS(ValueInfo_GetSourceModelLocation, _In_ const OrtValueInfo* value_info,
+                  _Out_ OrtInitializerSourceModelLocation* location);
+
+  /** \brief Get the location of an initializer's data as declared in the external data entries of the source model.
+   *
+   * Use this to reference the source model's weights, e.g., to leave an initializer out of a weightless compiled
+   * binary and resolve it from the source model when the binary is imported. Use
+   * ValueInfo_GetExternalInitializerInfo() to read the data in this session: it describes where the data is now, which
+   * may be a different location, or memory.
+   *
+   * Sets the output parameter `info` to NULL, and returns a NULL status (non-error), unless the given OrtValueInfo is
+   * an initializer whose ValueInfo_GetSourceModelLocation() is OrtInitializerSourceModelLocation_EXTERNAL and whose
+   * data the source model declared in an external data file. In particular, `info` is NULL for initializers that the
+   * application adds as external data with the OrtModelEditorApi, since no file is declared.
+   *
+   * For an initializer whose data is still read from its file, the result is the same as
+   * ValueInfo_GetExternalInitializerInfo(). When the application provides the external data files in memory
+   * (AddExternalInitializersFromFilesInMemory), ValueInfo_GetExternalInitializerInfo() returns NULL, but this function
+   * still returns the declared file path, offset and byte size. The file path is the 'location' entry of the source
+   * model, as declared (relative to the source model's directory unless absolute).
+   *
+   * Supports initializers defined in an outer scope (i.e., a parent graph).
+   *
+   * \param[in] value_info The OrtValueInfo instance.
+   * \param[out] info Output parameter set to an OrtExternalInitializerInfo instance that can be used to query the file
+   *                  path, file offset and byte size, or NULL. Must release with ReleaseExternalInitializerInfo.
+   *
+   * \snippet{doc} snippets.dox OrtStatus Return Value
+   *
+   * \note Returns ORT_NOT_IMPLEMENTED in minimal builds.
+   *
+   * \since Version 1.32.
+   */
+  ORT_API2_STATUS(ValueInfo_GetSourceModelExternalDataInfo, _In_ const OrtValueInfo* value_info,
+                  _Outptr_result_maybenull_ OrtExternalInitializerInfo** info);
 };
 
 /*

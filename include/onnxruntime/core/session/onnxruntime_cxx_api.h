@@ -3511,6 +3511,10 @@ struct ConstValueInfoImpl : Base<T> {
   bool IsGraphOutput() const;
   /// < A wrapper around OrtApi::ValueInfo_IsConstantInitializer
   bool IsConstantInitializer() const;
+  /// < A wrapper around OrtApi::ValueInfo_GetSourceModelLocation
+  OrtInitializerSourceModelLocation GetSourceModelLocation() const;
+  /// < A wrapper around OrtApi::ValueInfo_GetSourceModelExternalDataInfo
+  Status GetSourceModelExternalDataInfo(ExternalInitializerInfo& info) const;
   /// < A wrapper around OrtApi::ValueInfo_IsFromOuterScope
   bool IsFromOuterScope() const;
 };

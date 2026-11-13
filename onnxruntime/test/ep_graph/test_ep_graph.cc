@@ -4,10 +4,14 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <gsl/gsl>
 #include <iterator>
 #include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
 #include <vector>
 #include <fstream>
 
@@ -18,6 +22,9 @@
 #include "core/framework/onnxruntime_typeinfo.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "core/graph/ep_api_types.h"
+#include "core/graph/model_editor_api_types.h"
+#include "core/optimizer/constant_folding.h"
+#include "core/providers/cpu/cpu_execution_provider.h"
 #include "core/graph/graph_proto_serializer.h"
 
 #define ORT_EP_UTILS_ORT_GRAPH_TO_PROTO_IMPL
@@ -182,6 +189,461 @@ TEST(EpGraphTest, CheckModelExternalInitializers) {
   ASSERT_NE(test_graph, nullptr) << "Failed to load test model";
 
   CheckGraphCApi(test_graph->GetGraphViewer(), test_graph->GetOrtGraph());
+}
+
+// Test OrtApi::ValueInfo_GetSourceModelLocation() for a model with internal and external initializers.
+TEST(EpGraphTest, GetSourceModelLocation) {
+  auto test_graph = TestGraph::Load(ORT_TSTR("testdata/conv_qdq_external_ini.onnx"));
+  ASSERT_NE(test_graph, nullptr) << "Failed to load test model";
+
+  Ort::ConstGraph ort_graph{&test_graph->GetOrtGraph()};
+  size_t num_internal = 0;
+  size_t num_external = 0;
+  for (Ort::ConstValueInfo initializer : ort_graph.GetInitializers()) {
+    SCOPED_TRACE(initializer.GetName());
+    Ort::ExternalInitializerInfo external_info{nullptr};
+    ASSERT_CXX_ORTSTATUS_OK(initializer.GetExternalInitializerInfo(external_info));
+
+    const OrtInitializerSourceModelLocation location = initializer.GetSourceModelLocation();
+    EXPECT_EQ(location, external_info != nullptr ? OrtInitializerSourceModelLocation_EXTERNAL
+                                                 : OrtInitializerSourceModelLocation_INTERNAL);
+    ++(location == OrtInitializerSourceModelLocation_EXTERNAL ? num_external : num_internal);
+
+    // The data is still read from the file, so the declared location is the same as the current one.
+    Ort::ExternalInitializerInfo declared_info{nullptr};
+    ASSERT_CXX_ORTSTATUS_OK(initializer.GetSourceModelExternalDataInfo(declared_info));
+    ASSERT_EQ(declared_info != nullptr, external_info != nullptr);
+    if (external_info != nullptr) {
+      EXPECT_EQ(std::basic_string<ORTCHAR_T>(declared_info.GetFilePath()),
+                std::basic_string<ORTCHAR_T>(external_info.GetFilePath()));
+      EXPECT_EQ(declared_info.GetFileOffset(), external_info.GetFileOffset());
+      EXPECT_EQ(declared_info.GetByteSize(), external_info.GetByteSize());
+    }
+  }
+  EXPECT_GT(num_internal, 0u);
+  EXPECT_GT(num_external, 0u);
+
+  // Values that are not initializers.
+  for (Ort::ConstValueInfo input : ort_graph.GetInputs()) {
+    SCOPED_TRACE(input.GetName());
+    EXPECT_EQ(input.GetSourceModelLocation(), OrtInitializerSourceModelLocation_NONE);
+  }
+}
+
+namespace {
+// Model used to test the provenance of initializers (where the source model stored their data):
+//   inline_w: float[64] stored inside the model.
+//   ext_w, ext_w2: float[64] stored in kProvenanceDataFile at offsets 0 and 256.
+//   const_c: float[64] 'Constant' node.
+//   folded_src = Mul(inline_w, inline_w), which constant folding replaces with an initializer.
+//   a5 = X + inline_w + ext_w + ext_w2 + const_c + folded_src
+//   Y = If(cond) { then: ext_w + ext_w2, where 'ext_w' is a then-branch initializer that shadows the outer one }
+//                { else: ext_w + inline_w, both from the outer scope }
+constexpr const ORTCHAR_T* kProvenanceDataFile = ORT_TSTR("ep_graph_provenance_weights.bin");
+constexpr int64_t kProvenanceNumElements = 64;  // 256 bytes, larger than utils::kSmallTensorExternalDataThreshold.
+constexpr size_t kProvenanceTensorBytes = kProvenanceNumElements * sizeof(float);
+
+// Contents of kProvenanceDataFile: the data of ext_w, followed by the data of ext_w2.
+std::vector<float> ProvenanceFileData() {
+  std::vector<float> data(2 * kProvenanceNumElements);
+  for (size_t i = 0; i < data.size(); ++i) {
+    data[i] = static_cast<float>(i);
+  }
+  return data;
+}
+
+void WriteProvenanceDataFile() {
+  const std::vector<float> data = ProvenanceFileData();
+  std::ofstream file{std::basic_string<ORTCHAR_T>{kProvenanceDataFile}, std::ios::binary};
+  ASSERT_TRUE(file.is_open());
+  file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
+}
+
+void SetFloatTensorType(ONNX_NAMESPACE::ValueInfoProto& value_info, const std::string& name) {
+  value_info.set_name(name);
+  auto* tensor_type = value_info.mutable_type()->mutable_tensor_type();
+  tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  tensor_type->mutable_shape()->add_dim()->set_dim_value(kProvenanceNumElements);
+}
+
+ONNX_NAMESPACE::TensorProto MakeInlineFloatTensor(const std::string& name, float value) {
+  ONNX_NAMESPACE::TensorProto tensor;
+  tensor.set_name(name);
+  tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  tensor.add_dims(kProvenanceNumElements);
+  for (int64_t i = 0; i < kProvenanceNumElements; ++i) {
+    tensor.add_float_data(value);
+  }
+  return tensor;
+}
+
+ONNX_NAMESPACE::TensorProto MakeExternalFloatTensor(const std::string& name, size_t offset) {
+  ONNX_NAMESPACE::TensorProto tensor;
+  tensor.set_name(name);
+  tensor.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  tensor.add_dims(kProvenanceNumElements);
+  tensor.set_data_location(ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL);
+  for (const auto& [key, value] : {std::pair<std::string, std::string>{"location", ToUTF8String(kProvenanceDataFile)},
+                                   {"offset", std::to_string(offset)},
+                                   {"length", std::to_string(kProvenanceTensorBytes)}}) {
+    auto* entry = tensor.add_external_data();
+    entry->set_key(key);
+    entry->set_value(value);
+  }
+  return tensor;
+}
+
+void AddNode(ONNX_NAMESPACE::GraphProto& graph, const char* op_type, std::initializer_list<const char*> inputs,
+             const char* output) {
+  auto* node = graph.add_node();
+  node->set_op_type(op_type);
+  node->set_name(output);
+  for (const char* input : inputs) {
+    node->add_input(input);
+  }
+  node->add_output(output);
+}
+
+ONNX_NAMESPACE::ModelProto MakeProvenanceModelProto() {
+  ONNX_NAMESPACE::ModelProto model_proto;
+  model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+  auto* opset = model_proto.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(13);
+
+  auto& graph = *model_proto.mutable_graph();
+  graph.set_name("main_graph");
+  SetFloatTensorType(*graph.add_input(), "X");
+  auto& cond = *graph.add_input();
+  cond.set_name("cond");
+  cond.mutable_type()->mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_BOOL);
+  cond.mutable_type()->mutable_tensor_type()->mutable_shape();
+
+  *graph.add_initializer() = MakeInlineFloatTensor("inline_w", 2.0f);
+  *graph.add_initializer() = MakeExternalFloatTensor("ext_w", 0);
+  *graph.add_initializer() = MakeExternalFloatTensor("ext_w2", kProvenanceTensorBytes);
+
+  auto* constant = graph.add_node();
+  constant->set_op_type("Constant");
+  constant->set_name("const_c");
+  constant->add_output("const_c");
+  auto* value = constant->add_attribute();
+  value->set_name("value");
+  value->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_TENSOR);
+  *value->mutable_t() = MakeInlineFloatTensor("const_c", 3.0f);
+
+  AddNode(graph, "Mul", {"inline_w", "inline_w"}, "folded_src");
+  AddNode(graph, "Add", {"X", "inline_w"}, "a1");
+  AddNode(graph, "Add", {"a1", "ext_w"}, "a2");
+  AddNode(graph, "Add", {"a2", "ext_w2"}, "a3");
+  AddNode(graph, "Add", {"a3", "const_c"}, "a4");
+  AddNode(graph, "Add", {"a4", "folded_src"}, "a5");
+
+  ONNX_NAMESPACE::GraphProto then_branch;
+  then_branch.set_name("then_branch");
+  *then_branch.add_initializer() = MakeInlineFloatTensor("ext_w", 4.0f);  // Shadows the outer 'ext_w'.
+  AddNode(then_branch, "Add", {"ext_w", "ext_w2"}, "then_out");
+  SetFloatTensorType(*then_branch.add_output(), "then_out");
+
+  ONNX_NAMESPACE::GraphProto else_branch;
+  else_branch.set_name("else_branch");
+  AddNode(else_branch, "Add", {"ext_w", "inline_w"}, "else_out");
+  SetFloatTensorType(*else_branch.add_output(), "else_out");
+
+  AddNode(graph, "If", {"cond"}, "Y");
+  auto& if_node = *graph.mutable_node(graph.node_size() - 1);
+  for (auto& [attr_name, branch] : {std::pair<const char*, ONNX_NAMESPACE::GraphProto*>{"then_branch", &then_branch},
+                                    {"else_branch", &else_branch}}) {
+    auto* attr = if_node.add_attribute();
+    attr->set_name(attr_name);
+    attr->set_type(ONNX_NAMESPACE::AttributeProto_AttributeType_GRAPH);
+    *attr->mutable_g() = *branch;
+  }
+
+  SetFloatTensorType(*graph.add_output(), "a5");
+  SetFloatTensorType(*graph.add_output(), "Y");
+  return model_proto;
+}
+
+void LoadProvenanceModel(std::shared_ptr<Model>& model) {
+  ASSERT_NO_FATAL_FAILURE(WriteProvenanceDataFile());
+  ASSERT_STATUS_OK(Model::Load(MakeProvenanceModelProto(), model, nullptr, DefaultLoggingManager().DefaultLogger()));
+}
+
+// An external data location: file path, file offset, byte size.
+using DataLocation = std::tuple<std::basic_string<ORTCHAR_T>, int64_t, size_t>;
+
+struct Provenance {
+  OrtInitializerSourceModelLocation location = OrtInitializerSourceModelLocation_NONE;
+  std::optional<DataLocation> declared;  // ValueInfo_GetSourceModelExternalDataInfo
+  std::optional<DataLocation> current;   // ValueInfo_GetExternalInitializerInfo
+};
+
+std::optional<DataLocation> ToDataLocation(const Ort::ExternalInitializerInfo& info) {
+  if (info == nullptr) {
+    return std::nullopt;
+  }
+  return DataLocation{info.GetFilePath(), info.GetFileOffset(), info.GetByteSize()};
+}
+
+Provenance GetProvenance(Ort::ConstValueInfo value_info) {
+  Provenance result;
+  result.location = value_info.GetSourceModelLocation();
+
+  Ort::ExternalInitializerInfo declared{nullptr};
+  Ort::ThrowOnError(value_info.GetSourceModelExternalDataInfo(declared));
+  result.declared = ToDataLocation(declared);
+
+  Ort::ExternalInitializerInfo current{nullptr};
+  Ort::ThrowOnError(value_info.GetExternalInitializerInfo(current));
+  result.current = ToDataLocation(current);
+  return result;
+}
+
+// Finds a value of `graph` by name: an initializer, or an input of one of its nodes (e.g., an outer scope value).
+std::optional<Ort::ConstValueInfo> FindValue(Ort::ConstGraph graph, const std::string& name) {
+  for (Ort::ConstValueInfo initializer : graph.GetInitializers()) {
+    if (initializer.GetName() == name) {
+      return initializer;
+    }
+  }
+  for (Ort::ConstNode node : graph.GetNodes()) {
+    for (Ort::ConstValueInfo input : node.GetInputs()) {
+      if (input != nullptr && input.GetName() == name) {
+        return input;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// Checks the provenance of the value named `name` in `graph`.
+void ExpectProvenance(Ort::ConstGraph graph, const std::string& name, OrtInitializerSourceModelLocation location,
+                      const std::optional<DataLocation>& declared, const std::optional<DataLocation>& current) {
+  SCOPED_TRACE(name);
+  std::optional<Ort::ConstValueInfo> value_info = FindValue(graph, name);
+  ASSERT_TRUE(value_info.has_value());
+  const Provenance provenance = GetProvenance(*value_info);
+  EXPECT_EQ(provenance.location, location);
+  EXPECT_EQ(provenance.declared, declared);
+  EXPECT_EQ(provenance.current, current);
+}
+
+const DataLocation kExtWLocation{kProvenanceDataFile, 0, kProvenanceTensorBytes};
+const DataLocation kExtW2Location{kProvenanceDataFile, static_cast<int64_t>(kProvenanceTensorBytes),
+                                  kProvenanceTensorBytes};
+}  // namespace
+
+// Initializers stored inside the model, in an external data file, and created from a 'Constant' node.
+TEST(EpGraphTest, SourceModelProvenance_ModelInitializers) {
+  std::shared_ptr<Model> model;
+  ASSERT_NO_FATAL_FAILURE(LoadProvenanceModel(model));
+  auto cleanup = gsl::finally([]() { std::filesystem::remove(kProvenanceDataFile); });
+
+  TestGraph test_graph(model);
+  Ort::ConstGraph graph{&test_graph.GetOrtGraph()};
+
+  // The data is read from the file, so the declared location is the current one.
+  ExpectProvenance(graph, "ext_w", OrtInitializerSourceModelLocation_EXTERNAL, kExtWLocation, kExtWLocation);
+  ExpectProvenance(graph, "ext_w2", OrtInitializerSourceModelLocation_EXTERNAL, kExtW2Location, kExtW2Location);
+  ExpectProvenance(graph, "inline_w", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt, std::nullopt);
+  // The model stores 'Constant' node data in node attributes, not in initializers.
+  ExpectProvenance(graph, "const_c", OrtInitializerSourceModelLocation_NONE, std::nullopt, std::nullopt);
+  // Not an initializer.
+  ExpectProvenance(graph, "X", OrtInitializerSourceModelLocation_NONE, std::nullopt, std::nullopt);
+}
+
+// AddExternalInitializersFromFilesInMemory provides the model's external data files, so the initializers are still
+// external and keep their declared location, both when ORT aliases the application's buffer and when it copies it.
+TEST(EpGraphTest, SourceModelProvenance_ExternalDataFilesInMemory) {
+  for (bool use_buffers_directly : {true, false}) {
+    SCOPED_TRACE(use_buffers_directly ? "aliased buffer" : "copied buffer");
+    std::shared_ptr<Model> model;
+    ASSERT_NO_FATAL_FAILURE(LoadProvenanceModel(model));
+    auto cleanup = gsl::finally([]() { std::filesystem::remove(kProvenanceDataFile); });
+
+    std::vector<float> file_data = ProvenanceFileData();
+    const InlinedHashMap<PathString, std::pair<char*, size_t>> files = {
+        {kProvenanceDataFile, {reinterpret_cast<char*>(file_data.data()), file_data.size() * sizeof(float)}}};
+    ASSERT_STATUS_OK(model->MainGraph().InjectExternalInitializersFromFilesInMemory(files, use_buffers_directly));
+
+    TestGraph test_graph(model);
+    Ort::ConstGraph graph{&test_graph.GetOrtGraph()};
+
+    // The data is in memory, so ValueInfo_GetExternalInitializerInfo() returns NULL.
+    ExpectProvenance(graph, "ext_w", OrtInitializerSourceModelLocation_EXTERNAL, kExtWLocation, std::nullopt);
+    ExpectProvenance(graph, "ext_w2", OrtInitializerSourceModelLocation_EXTERNAL, kExtW2Location, std::nullopt);
+    ExpectProvenance(graph, "inline_w", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt, std::nullopt);
+
+    // Check that the test covers both ways of providing the data.
+    std::optional<Ort::ConstValueInfo> ext_w = FindValue(graph, "ext_w");
+    ASSERT_TRUE(ext_w.has_value());
+    Ort::ConstValue ext_w_value{nullptr};
+    ASSERT_CXX_ORTSTATUS_OK(ext_w->GetInitializer(ext_w_value));
+    EXPECT_EQ(ext_w_value.GetTensorRawData() == file_data.data(), use_buffers_directly);
+  }
+}
+
+// AddExternalInitializers provides data that is not guaranteed to match the model's, so the initializer is not from
+// the source model anymore. It only replaces external initializers.
+TEST(EpGraphTest, SourceModelProvenance_AddExternalInitializers) {
+  std::shared_ptr<Model> model;
+  ASSERT_NO_FATAL_FAILURE(LoadProvenanceModel(model));
+  auto cleanup = gsl::finally([]() { std::filesystem::remove(kProvenanceDataFile); });
+  Graph& main_graph = model->MainGraph();
+
+  std::vector<float> data(kProvenanceNumElements, 5.0f);
+  OrtValue ort_value;
+  Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), TensorShape{kProvenanceNumElements}, data.data(),
+                       OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator), ort_value);
+  ASSERT_STATUS_OK(main_graph.InjectExternalInitializedTensors({{"ext_w", ort_value}}));
+
+  // ORT rejects replacing an initializer stored inside the model.
+  Status status = main_graph.InjectExternalInitializedTensors({{"inline_w", ort_value}});
+  ASSERT_FALSE(status.IsOK());
+  EXPECT_THAT(status.ErrorMessage(), ::testing::HasSubstr("non-external initializer"));
+
+  TestGraph test_graph(model);
+  Ort::ConstGraph graph{&test_graph.GetOrtGraph()};
+
+  ExpectProvenance(graph, "ext_w", OrtInitializerSourceModelLocation_NONE, std::nullopt, std::nullopt);
+  ExpectProvenance(graph, "ext_w2", OrtInitializerSourceModelLocation_EXTERNAL, kExtW2Location, kExtW2Location);
+  ExpectProvenance(graph, "inline_w", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt, std::nullopt);
+}
+
+// Initializers that ORT creates (constant folding) or rewrites under the same name (as the layout transformation
+// does) are not in the source model.
+TEST(EpGraphTest, SourceModelProvenance_InitializersCreatedByOrt) {
+  std::shared_ptr<Model> model;
+  ASSERT_NO_FATAL_FAILURE(LoadProvenanceModel(model));
+  auto cleanup = gsl::finally([]() { std::filesystem::remove(kProvenanceDataFile); });
+  Graph& main_graph = model->MainGraph();
+  const logging::Logger& logger = DefaultLoggingManager().DefaultLogger();
+
+  // Constant folding replaces Mul(inline_w, inline_w) with the initializer 'folded_src'.
+  auto cpu_ep = std::make_unique<CPUExecutionProvider>(CPUExecutionProviderInfo());
+  const ConfigOptions config_options;
+  ConstantFolding constant_folding(*cpu_ep, /*skip_dequantize_linear*/ false, config_options);
+  bool modified = false;
+  ASSERT_STATUS_OK(constant_folding.Apply(main_graph, modified, logger));
+  ASSERT_TRUE(modified);
+  ASSERT_NE(main_graph.GetConstantInitializer("folded_src", /*check_outer_scope*/ false), nullptr);
+
+  // Remove 'ext_w2' and add it again with the same data.
+  const ONNX_NAMESPACE::TensorProto* ext_w2 = nullptr;
+  ASSERT_TRUE(main_graph.GetInitializedTensor("ext_w2", ext_w2));
+  ASSERT_NE(ext_w2, nullptr);
+  const ONNX_NAMESPACE::TensorProto ext_w2_copy = *ext_w2;
+  main_graph.RemoveInitializedTensor("ext_w2");
+  main_graph.AddInitializedTensor(ext_w2_copy);
+  ASSERT_STATUS_OK(main_graph.Resolve());
+
+  TestGraph test_graph(model);
+  Ort::ConstGraph graph{&test_graph.GetOrtGraph()};
+
+  ExpectProvenance(graph, "folded_src", OrtInitializerSourceModelLocation_NONE, std::nullopt, std::nullopt);
+  // The data is still in the file, but the source model is no longer known to provide it.
+  ExpectProvenance(graph, "ext_w2", OrtInitializerSourceModelLocation_NONE, std::nullopt, kExtW2Location);
+  ExpectProvenance(graph, "ext_w", OrtInitializerSourceModelLocation_EXTERNAL, kExtWLocation, kExtWLocation);
+}
+
+// Outer scope initializers used in a subgraph have the provenance they have in the parent graph, and a subgraph
+// initializer shadows an outer one with the same name.
+TEST(EpGraphTest, SourceModelProvenance_Subgraphs) {
+  std::shared_ptr<Model> model;
+  ASSERT_NO_FATAL_FAILURE(LoadProvenanceModel(model));
+  auto cleanup = gsl::finally([]() { std::filesystem::remove(kProvenanceDataFile); });
+
+  TestGraph test_graph(model);
+  Ort::ConstGraph graph{&test_graph.GetOrtGraph()};
+
+  std::optional<Ort::ConstGraph> then_branch;
+  std::optional<Ort::ConstGraph> else_branch;
+  for (Ort::ConstNode node : graph.GetNodes()) {
+    if (node.GetOperatorType() != "If") {
+      continue;
+    }
+    for (const Ort::AttrNameSubgraph& subgraph : node.GetSubgraphs()) {
+      (subgraph.attr_name == "then_branch" ? then_branch : else_branch) = subgraph.sub_graph;
+    }
+  }
+  ASSERT_TRUE(then_branch.has_value());
+  ASSERT_TRUE(else_branch.has_value());
+
+  // The then-branch initializer 'ext_w' shadows the outer external one. ValueInfo_GetExternalInitializerInfo() is not
+  // checked: it falls back to the outer 'ext_w' because the local one has no external data (existing behavior of
+  // Graph::GetExternalInitializerInfo()).
+  {
+    std::optional<Ort::ConstValueInfo> shadowing_ext_w = FindValue(*then_branch, "ext_w");
+    ASSERT_TRUE(shadowing_ext_w.has_value());
+    const Provenance provenance = GetProvenance(*shadowing_ext_w);
+    EXPECT_EQ(provenance.location, OrtInitializerSourceModelLocation_INTERNAL);
+    EXPECT_EQ(provenance.declared, std::nullopt);
+  }
+  ExpectProvenance(*then_branch, "ext_w2", OrtInitializerSourceModelLocation_EXTERNAL, kExtW2Location,
+                   kExtW2Location);
+  ExpectProvenance(*else_branch, "ext_w", OrtInitializerSourceModelLocation_EXTERNAL, kExtWLocation, kExtWLocation);
+  ExpectProvenance(*else_branch, "inline_w", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt,
+                   std::nullopt);
+}
+
+// The initializers of a model created with the OrtModelEditorApi are the model's initializers. The ones whose data the
+// application adds as external data are external, without a declared file.
+TEST(EpGraphTest, SourceModelProvenance_ModelEditorApiModel) {
+  const logging::Logger& logger = DefaultLoggingManager().DefaultLogger();
+  ModelEditorGraph editor_graph;
+  const TensorShape shape{kProvenanceNumElements};
+  auto make_value_info = [&](const char* name) {
+    auto value_info = std::make_unique<ModelEditorValueInfo>();
+    value_info->name = name;
+    value_info->type_info = std::make_unique<OrtTypeInfo>(
+        ONNX_TYPE_TENSOR,
+        OrtTensorTypeAndShapeInfo::GetTensorShapeAndTypeHelper(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &shape, nullptr));
+    return std::unique_ptr<ModelEditorValueInfo, OrtValueInfoDeleter>(value_info.release());
+  };
+  editor_graph.inputs.push_back(make_value_info("X"));
+  editor_graph.outputs.push_back(make_value_info("Y"));
+
+  std::vector<float> external_data(kProvenanceNumElements, 1.0f);
+  auto make_ort_value = [&](bool is_external) {
+    auto ort_value = std::make_unique<OrtValue>();
+    if (is_external) {
+      Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), shape, external_data.data(),
+                           OrtMemoryInfo(onnxruntime::CPU, OrtAllocatorType::OrtDeviceAllocator), *ort_value);
+    } else {
+      Tensor::InitOrtValue(DataTypeImpl::GetType<float>(), shape, CPUAllocator::DefaultInstance(), *ort_value);
+    }
+    return std::unique_ptr<OrtValue, OrtValueDeleter>(ort_value.release());
+  };
+  editor_graph.initializers.emplace("internal", make_ort_value(false));
+  editor_graph.external_initializers.emplace("external", make_ort_value(true));
+
+  // Y = (X + internal) + external
+  for (const auto& [inputs, output] : {std::pair<std::array<const char*, 2>, const char*>{{"X", "internal"}, "sum"},
+                                       {{"sum", "external"}, "Y"}}) {
+    auto node = std::make_unique<ModelEditorNode>();
+    node->operator_name = "Add";
+    node->node_name = output;
+    node->input_names = {inputs[0], inputs[1]};
+    node->output_names = {output};
+    editor_graph.nodes.push_back(std::unique_ptr<ModelEditorNode, OrtNodeDeleter>(node.release()));
+  }
+
+  const std::unordered_map<std::string, int> domain_to_version{{kOnnxDomain, 13}};
+  Model model("model_editor_provenance", false, ModelMetaData(), PathString(), IOnnxRuntimeOpSchemaRegistryList(),
+              domain_to_version, {}, logger);
+  std::unique_ptr<Graph> loaded_graph;
+  ASSERT_STATUS_OK(Graph::LoadFromModelEditorApiModel(editor_graph, model, domain_to_version,
+                                                      model.MainGraph().GetSchemaRegistry(), false, logger,
+                                                      loaded_graph));
+
+  GraphViewer graph_viewer(*loaded_graph);
+  std::unique_ptr<EpGraph> ep_graph;
+  ASSERT_STATUS_OK(EpGraph::Create(graph_viewer, ep_graph));
+  Ort::ConstGraph graph{ep_graph.get()};
+
+  ExpectProvenance(graph, "internal", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt, std::nullopt);
+  ExpectProvenance(graph, "external", OrtInitializerSourceModelLocation_EXTERNAL, std::nullopt, std::nullopt);
 }
 
 static void RunConvQDQExtIni(const ORTCHAR_T* model_path, std::vector<float>& output_data) {

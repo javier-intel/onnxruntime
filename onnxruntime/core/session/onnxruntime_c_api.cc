@@ -2909,6 +2909,34 @@ ORT_API_STATUS_IMPL(OrtApis::ValueInfo_GetExternalInitializerInfo, _In_ const Or
   API_IMPL_END
 }
 
+ORT_API_STATUS_IMPL(OrtApis::ValueInfo_GetSourceModelLocation, _In_ const OrtValueInfo* value_info,
+                    _Out_ OrtInitializerSourceModelLocation* location) {
+  API_IMPL_BEGIN
+  if (location == nullptr) {
+    return OrtApis::CreateStatus(ORT_INVALID_ARGUMENT, "'location' argument is NULL");
+  }
+
+  ORT_API_RETURN_IF_STATUS_NOT_OK(value_info->GetSourceModelLocation(*location));
+  return nullptr;
+  API_IMPL_END
+}
+
+ORT_API_STATUS_IMPL(OrtApis::ValueInfo_GetSourceModelExternalDataInfo, _In_ const OrtValueInfo* value_info,
+                    _Outptr_result_maybenull_ OrtExternalInitializerInfo** info) {
+  API_IMPL_BEGIN
+  if (info == nullptr) {
+    return OrtApis::CreateStatus(ORT_INVALID_ARGUMENT, "'info' argument is NULL");
+  }
+
+  std::unique_ptr<onnxruntime::ExternalDataInfo> ext_data_info = nullptr;
+  ORT_API_RETURN_IF_STATUS_NOT_OK(value_info->GetSourceModelExternalDataInfo(ext_data_info));
+
+  // Note: ext_data_info is nullptr if the source model doesn't declare an external data file for this OrtValueInfo.
+  *info = static_cast<OrtExternalInitializerInfo*>(ext_data_info.release());
+  return nullptr;
+  API_IMPL_END
+}
+
 ORT_API(void, OrtApis::ReleaseExternalInitializerInfo, _Frees_ptr_opt_ OrtExternalInitializerInfo* info) {
   delete static_cast<onnxruntime::ExternalDataInfo*>(info);
 }
@@ -4990,6 +5018,9 @@ static constexpr OrtApi ort_api_1_to_29 = {
 
     &OrtApis::EpDevice_GetMemoryCapacity,
     // End of Version 32 - DO NOT MODIFY ABOVE (see above text for more information)
+
+    &OrtApis::ValueInfo_GetSourceModelLocation,
+    &OrtApis::ValueInfo_GetSourceModelExternalDataInfo,
 };
 
 // OrtApiBase can never change as there is no way to know what version of OrtApiBase is returned by OrtGetApiBase.

@@ -143,10 +143,11 @@ class ExampleEp : public OrtEp, public ApiPtrs {
 
   // If the given `OrtValueInfo` represents a constant initializer that this EP copies in the selected weightless
   // mode, this function saves a copy of the initializer data within this EP instance so that it is available during
-  // inference:
+  // inference. The source model location (OrtApi::ValueInfo_GetSourceModelLocation) determines which ones:
   // - OrtWeightlessSupport_NONE: all constant initializers.
-  // - OrtWeightlessSupport_EXTERNAL_ONLY: constant initializers stored inside the ONNX model (not external data).
-  // - OrtWeightlessSupport_ALL: none.
+  // - OrtWeightlessSupport_EXTERNAL_ONLY: all but the external initializers of the source model.
+  // - OrtWeightlessSupport_ALL: the initializers that are not in the source model (e.g., created by constant
+  //   folding).
   OrtStatus* TrySaveConstantInitializer(Ort::ConstValueInfo maybe_initializer);
 
   ExampleEpFactory& factory_;

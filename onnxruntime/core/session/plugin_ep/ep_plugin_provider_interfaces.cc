@@ -28,7 +28,6 @@
 #include "core/framework/external_data_loader_thread_pool.h"
 #include "core/framework/plugin_data_transfer.h"
 #include "core/framework/plugin_ep_stream.h"
-#include "core/framework/tensor_external_data_info.h"
 #include "core/framework/resource_accountant.h"
 #include "core/framework/tensor.h"
 #include "core/common/inlined_containers.h"
@@ -211,6 +210,10 @@ struct FusedNodeConstantInitializers {
   // Not inputs of the fused node (drop_constant_initializers = true): the EP obtains the data itself, either by copying
   // it or, in weightless mode, by keeping references to it.
   bool dropped_internal = false;  // Stored inside the source model.
+  // Created by ORT after loading the source model, e.g., by constant folding or the layout transformation, so not in
+  // the source model. Number of them, and the name of one of them (for messages).
+  size_t num_dropped_generated = 0;
+  std::string dropped_generated_example;
   bool dropped_external = false;  // Stored in the source model's external data files.
 };
 
@@ -240,8 +243,9 @@ FusedNodeConstantInitializers GetFusedNodeConstantInitializers(
       return;
     }
 
-    std::unique_ptr<ExternalDataInfo> external_data_info;
-    const bool is_external = graph.GetExternalInitializerInfo(name, external_data_info, /*check_outer_scope*/ true);
+    // Classify the initializer by where the source model stored it, rather than by where its data is now: external
+    // data that the app provides in memory is still external.
+    const bool is_external = graph.IsExternalInitializerFromModel(name, /*check_outer_scope*/ true);
     // Only values of the graph that contains the fused node can be inputs of the fused node. Initializers defined
     // inside a subgraph are always obtained by the EP.
     if (&graph == &fused_graph && fused_node_inputs.count(name) != 0) {
@@ -253,8 +257,13 @@ FusedNodeConstantInitializers GetFusedNodeConstantInitializers(
       }
     } else if (is_external) {
       result.dropped_external = true;
-    } else {
+    } else if (graph.IsInitializerFromModel(name, /*check_outer_scope*/ true)) {
       result.dropped_internal = true;
+    } else {
+      if (result.num_dropped_generated == 0) {
+        result.dropped_generated_example = name;
+      }
+      ++result.num_dropped_generated;
     }
   };
 
@@ -1088,6 +1097,8 @@ Status PluginExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& fu
 
     size_t num_copied_internal_initializers = 0;
     std::string copied_internal_initializer_example;
+    size_t num_generated_initializers = 0;
+    std::string generated_initializer_example;
     for (const FusedNodeAndGraph& node_and_graph : fused_nodes_and_graphs) {
       FusedNodeConstantInitializers initializers = GetFusedNodeConstantInitializers(node_and_graph);
 
@@ -1102,6 +1113,27 @@ Status PluginExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& fu
         copied_internal_initializer_example = std::move(initializers.provided_internal_example);
       }
       num_copied_internal_initializers += initializers.num_provided_internal;
+
+      if (num_generated_initializers == 0) {
+        generated_initializer_example = std::move(initializers.dropped_generated_example);
+      }
+      num_generated_initializers += initializers.num_dropped_generated;
+    }
+
+    // Initializers that ORT created after loading the source model, e.g., by constant folding or the layout
+    // transformation, are not in the source model. In OrtWeightlessSupport_ALL mode, an EP that obtains them itself
+    // can't keep references to them that are resolved from the source model at runtime. They are not recorded as a
+    // dependency, since the source model doesn't provide them.
+    if (mode == OrtWeightlessSupport_ALL && num_generated_initializers != 0) {
+      LOGS(GetEpLoggerOrDefault(), WARNING)
+          << "Weightless mode requested (" << requested_option << ") but " << num_generated_initializers
+          << " constant initializers of the nodes compiled by EP '" << Type() << "' (e.g., '"
+          << generated_initializer_example << "') are not in the source model: they were created by ORT after "
+          << "loading the source model, e.g., by constant folding or the layout transformation, or their data was "
+          << "provided with AddExternalInitializers. The EP obtains "
+          << "them itself (drop_constant_initializers is true), so it must embed them in the EPContext model: "
+          << "references to them can't be resolved from the source model at runtime. Consider compiling with "
+          << "graph optimizations disabled.";
     }
 
     // ORT copies the internal initializers it provides into the EPContext model, unless the app stores them

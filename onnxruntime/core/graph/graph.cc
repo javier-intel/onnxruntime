@@ -1331,6 +1331,36 @@ Graph::Graph(const Model& owning_model,
   ArgNameToTypeMap name_to_type_map;
   const auto& model_path = ModelPath();
 
+  // Remember the initializers of the model, and where it declared the data of its external initializers, before
+  // 'Constant' nodes and sparse initializers are added to them. The initializers created from 'Constant' nodes and
+  // sparse initializers are therefore not the model's initializers (OrtInitializerSourceModelLocation_NONE). Reporting
+  // the initializers of 'Constant' nodes as OrtInitializerSourceModelLocation_INTERNAL later would be an ORT-only
+  // change (recording their names here too, no API change); EPs referencing them would then have to resolve their data
+  // from the 'Constant' nodes of the source model.
+  {
+    model_initializer_names_.reserve(graph_proto_->initializer_size());
+    InlinedHashMap<PathString, uint32_t> path_indices;
+    for (const auto& tensor : graph_proto_->initializer()) {
+      model_initializer_names_.insert(tensor.name());
+      if (!utils::HasExternalDataInFile(tensor)) {
+        continue;
+      }
+
+      ModelExternalDataLocation location{kNoDeclaredFile, 0, 0};
+      std::unique_ptr<ExternalDataInfo> external_data_info;
+      if (ExternalDataInfo::Create(tensor.external_data(), external_data_info).IsOK()) {
+        auto [it, inserted] = path_indices.emplace(external_data_info->GetRelPath(),
+                                                   narrow<uint32_t>(model_external_data_paths_.size()));
+        if (inserted) {
+          model_external_data_paths_.push_back(external_data_info->GetRelPath());
+        }
+        location = {it->second, static_cast<int64_t>(external_data_info->GetOffset()),
+                    external_data_info->GetLength()};
+      }
+      model_external_data_locations_.insert_or_assign(tensor.name(), location);
+    }
+  }
+
   // Process 'Constant' nodes
   // Put the 'TensorProto' stored in the 'Constant' nodes attribute into the graphs initializer list
   for (auto& node : graph_proto_->node()) {
@@ -4298,6 +4328,11 @@ void Graph::RemoveInitializedTensor(const std::string& tensor_name) {
   found = iter != name_to_initial_tensor_.end();
   if (found) {
     name_to_initial_tensor_.erase(iter);
+#if !defined(ORT_MINIMAL_BUILD)
+    // An initializer added later under the same name doesn't hold the model's data.
+    model_initializer_names_.erase(tensor_name);
+    model_external_data_locations_.erase(tensor_name);
+#endif  // !defined(ORT_MINIMAL_BUILD)
 #if !defined(DISABLE_SPARSE_TENSORS)
     sparse_tensor_names_.erase(tensor_name);
 #endif
@@ -4444,6 +4479,14 @@ Status Graph::InjectExternalInitializedTensors(const InlinedHashMap<std::string,
 
     ORT_RETURN_IF_ERROR(ReplaceInitializedTensorImpl(std::move(tensor_proto), std::move(ort_value), true));
     LOGS(logger_, INFO) << "Replaced external initializer: " << name;
+
+#if !defined(ORT_MINIMAL_BUILD)
+    // The application's data is not guaranteed to match the model's, so the initializer is no longer one of the
+    // model's initializers (OrtInitializerSourceModelLocation_NONE). This is not done in ReplaceInitializedTensorImpl()
+    // because InjectExternalInitializersFromFilesInMemory() provides the model's own external data files.
+    model_initializer_names_.erase(name);
+    model_external_data_locations_.erase(name);
+#endif  // !defined(ORT_MINIMAL_BUILD)
   }
   return Status::OK();
 }
@@ -4631,8 +4674,62 @@ bool Graph::GetExternalInitializerInfo(const std::string& name, std::unique_ptr<
   return false;
 }
 
+#if !defined(ORT_MINIMAL_BUILD)
+bool Graph::IsInitializerFromModel(const std::string& name, bool check_outer_scope) const {
+  if (name_to_initial_tensor_.count(name) != 0) {
+    return model_initializer_names_.count(name) != 0;
+  }
+
+  if (check_outer_scope && IsSubgraph() && IsOuterScopeValue(name)) {
+    return parent_graph_->IsInitializerFromModel(name, check_outer_scope);
+  }
+
+  return false;
+}
+
+bool Graph::IsExternalInitializerFromModel(const std::string& name, bool check_outer_scope) const {
+  if (name_to_initial_tensor_.count(name) != 0) {
+    return model_external_data_locations_.count(name) != 0;
+  }
+
+  if (check_outer_scope && IsSubgraph() && IsOuterScopeValue(name)) {
+    return parent_graph_->IsExternalInitializerFromModel(name, check_outer_scope);
+  }
+
+  return false;
+}
+
+bool Graph::GetSourceModelExternalDataInfo(const std::string& name, std::unique_ptr<ExternalDataInfo>& ext_info,
+                                           bool check_outer_scope) const {
+  // A local initializer shadows any outer scope value with the same name.
+  if (name_to_initial_tensor_.count(name) != 0) {
+    auto it = model_external_data_locations_.find(name);
+    if (it == model_external_data_locations_.end() || it->second.path_index == kNoDeclaredFile) {
+      return false;
+    }
+
+    const ModelExternalDataLocation& location = it->second;
+    ext_info = std::make_unique<ExternalDataInfo>(model_external_data_paths_[location.path_index],
+                                                  static_cast<ExternalDataInfo::OFFSET_TYPE>(location.offset),
+                                                  location.length);
+    return true;
+  }
+
+  if (check_outer_scope && IsSubgraph() && IsOuterScopeValue(name)) {
+    return parent_graph_->GetSourceModelExternalDataInfo(name, ext_info, check_outer_scope);
+  }
+
+  return false;
+}
+#endif  // !defined(ORT_MINIMAL_BUILD)
+
 void Graph::CleanAllInitializedTensors() noexcept {
   name_to_initial_tensor_.clear();
+#if !defined(ORT_MINIMAL_BUILD)
+  model_initializer_names_.clear();
+  model_external_data_locations_.clear();
+  model_external_data_paths_.clear();
+#endif  // !defined(ORT_MINIMAL_BUILD)
 #if !defined(DISABLE_SPARSE_TENSORS)
   sparse_tensor_names_.clear();
 #endif
@@ -7329,6 +7426,14 @@ Status Graph::LoadFromModelEditorApiModel(const OrtGraph& api_graph, bool updati
       ORT_IGNORE_RETURN_VALUE(GetOrCreateNodeArg(name, &type_proto));
 
       name_to_initial_tensor_.emplace(name, &tensor_proto);
+
+      // The initializers of an OrtModel are the model's initializers. Data the application provides as external
+      // (memory that ORT doesn't own) corresponds to external data.
+      model_initializer_names_.insert(name);
+      if (is_external) {
+        // There's no declared file: the data is in the application's memory.
+        model_external_data_locations_.insert_or_assign(name, ModelExternalDataLocation{kNoDeclaredFile, 0, 0});
+      }
     }
   };
 

@@ -113,6 +113,25 @@ struct OrtValueInfo {
       std::unique_ptr<onnxruntime::ExternalDataInfo>& ext_info) const = 0;
 
   /// <summary>
+  /// Get where the source model stored this initializer's data. See OrtInitializerSourceModelLocation.
+  /// </summary>
+  /// <param name="location">Output parameter set to OrtInitializerSourceModelLocation_NONE if this OrtValueInfo is
+  /// not an initializer from the source model.</param>
+  /// <returns>A status indicating an error or success.</returns>
+  virtual onnxruntime::Status GetSourceModelLocation(OrtInitializerSourceModelLocation& location) const = 0;
+
+  /// <summary>
+  /// Get the location (file path, file offset, byte size) of this initializer's data as declared in the source model's
+  /// external data entries. See OrtApi::ValueInfo_GetSourceModelExternalDataInfo.
+  /// </summary>
+  /// <param name="ext_info">Output parameter set to the declared location, or NULL if the source model doesn't declare
+  /// an external data file for this OrtValueInfo.</param>
+  /// <returns>A status indicating an error or success. Calling this function on an OrtValueInfo without a declared
+  /// external data file is NOT an error.</returns>
+  virtual onnxruntime::Status GetSourceModelExternalDataInfo(
+      std::unique_ptr<onnxruntime::ExternalDataInfo>& ext_info) const = 0;
+
+  /// <summary>
   /// Determine if the value is a required graph input.
   /// </summary>
   /// <param name="is_required_graph_input">Output parameter set to true if the value is a required graph input.</param>

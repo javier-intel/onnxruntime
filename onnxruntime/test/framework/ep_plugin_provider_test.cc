@@ -1391,6 +1391,163 @@ TEST(PluginExecutionProviderTest, Compile_WeightlessDependenciesIncludeSubgraphI
   }
 }
 
+// Test that in weightless mode OrtWeightlessSupport_ALL, the constant initializers that ORT created after loading the
+// source model (e.g., by constant folding or the layout transformation) are not recorded as a dependency on the
+// source model, and that ORT warns about them: an EP that obtains them itself can't resolve references to them from
+// the source model.
+TEST(PluginExecutionProviderTest, Compile_WeightlessWarnsAboutInitializersNotInSourceModel) {
+  enum class Origin { kModel,
+                      kAddedAfterLoad,
+                      kReplacedAfterLoad };
+
+  // Compiles Y = Mul(X, W) where the fused node doesn't have W as input (the EP obtains it itself), with W from the
+  // source model, added after loading, or replaced after loading under the same name (as the layout transformation
+  // does when it transposes an initializer).
+  auto compile = [](Origin origin, IExecutionProvider::EpContextExternalDependencies& dependencies,
+                    std::vector<std::string>& messages) {
+    ONNX_NAMESPACE::ModelProto model_proto;
+    model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+    auto* opset = model_proto.add_opset_import();
+    opset->set_domain("");
+    opset->set_version(13);
+
+    auto* graph_proto = model_proto.mutable_graph();
+    graph_proto->set_name("main_graph");
+    for (const char* name : {"X", "Y"}) {
+      auto& value_info = name[0] == 'X' ? *graph_proto->add_input() : *graph_proto->add_output();
+      value_info.set_name(name);
+      auto* tensor_type = value_info.mutable_type()->mutable_tensor_type();
+      tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+      tensor_type->mutable_shape()->add_dim()->set_dim_value(2);
+    }
+    auto* mul = graph_proto->add_node();
+    mul->set_op_type("Mul");
+    mul->set_name("mul");
+    mul->add_input("X");
+    mul->add_input("W");
+    mul->add_output("Y");
+
+    ONNX_NAMESPACE::TensorProto w;
+    w.set_name("W");
+    w.set_data_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+    w.add_dims(2);
+    w.add_float_data(1.0f);
+    w.add_float_data(2.0f);
+    if (origin != Origin::kAddedAfterLoad) {
+      *graph_proto->add_initializer() = w;
+    } else {
+      // W is a graph input until ORT replaces it with a new initializer below.
+      auto& w_input = *graph_proto->add_input();
+      w_input.set_name("W");
+      auto* tensor_type = w_input.mutable_type()->mutable_tensor_type();
+      tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+      tensor_type->mutable_shape()->add_dim()->set_dim_value(2);
+    }
+
+    std::shared_ptr<Model> model;
+    ASSERT_STATUS_OK(Model::Load(std::move(model_proto), model, nullptr, DefaultLoggingManager().DefaultLogger()));
+    Graph& graph = model->MainGraph();
+    if (origin == Origin::kAddedAfterLoad) {
+      // Replace the graph input W with a constant initializer, as graph optimizations add new initializers.
+      graph.SetInputs(std::vector<const NodeArg*>{graph.GetNodeArg("X")});
+      graph.AddInitializedTensor(w);
+      ASSERT_STATUS_OK(graph.Resolve());
+      ASSERT_NE(graph.GetConstantInitializer("W", /*check_outer_scope*/ false), nullptr);
+    } else if (origin == Origin::kReplacedAfterLoad) {
+      graph.RemoveInitializedTensor("W");
+      w.set_float_data(1, 3.0f);
+      graph.AddInitializedTensor(w);
+    }
+    ASSERT_EQ(graph.IsInitializerFromModel("W"), origin == Origin::kModel);
+
+    // Fuse the Mul node without W as an input of the fused node (drop_constant_initializers = true).
+    const Node* mul_node = graph.GetProducerNode("Y");
+    ASSERT_NE(mul_node, nullptr);
+    IndexedSubGraph indexed_sub_graph;
+    indexed_sub_graph.nodes.push_back(mul_node->Index());
+    auto meta_def = std::make_unique<IndexedSubGraph::MetaDef>();
+    meta_def->name = "TestOrtEp_mul";
+    meta_def->domain = "TestOrtEp";
+    meta_def->since_version = 1;
+    meta_def->inputs = {"X"};
+    meta_def->outputs = {"Y"};
+    indexed_sub_graph.SetMetaDef(std::move(meta_def));
+    GraphViewer graph_viewer(graph, indexed_sub_graph);
+    Node& fused_node = graph.BeginFuseSubGraph(indexed_sub_graph, "TestOrtEp_mul");
+
+    auto hw_device = test_plugin_ep::MakeTestOrtHardwareDevice(OrtHardwareDeviceType_CPU);
+    auto ep_device = test_plugin_ep::MakeTestOrtEpDevice(hw_device.get());
+    ep_device->ep_metadata.Add(kOrtEpDevice_EpMetadataKey_WeightlessSupportedModes, "all");
+    const std::vector<const OrtEpDevice*> ep_devices{ep_device.get()};
+
+    auto capturing_sink = std::make_unique<CapturingSink>();
+    CapturingSink* sink = capturing_sink.get();
+    logging::LoggingManager logging_manager(std::move(capturing_sink), logging::Severity::kWARNING, false,
+                                            logging::LoggingManager::InstanceType::Temporal);
+    std::unique_ptr<logging::Logger> logger = logging_manager.CreateLogger("WeightlessTest");
+
+    Ort::SessionOptions session_options;
+    session_options.AddConfigEntry(kOrtSessionOptionEpContextEnable, "1");
+    session_options.AddConfigEntry(kOrtSessionOptionEpEnableWeightlessMode, "2");
+
+    auto ort_ep = std::make_unique<test_plugin_ep::TestOrtEp>();
+    ort_ep->GetWeightlessSupport = [](const OrtEp*, OrtWeightlessSupport* support) noexcept -> ::OrtStatus* {
+      *support = OrtWeightlessSupport_ALL;
+      return nullptr;
+    };
+    // ORT determines the dependencies before it calls OrtEp::Compile(), so the test EP stops the compilation there.
+    ort_ep->Compile = [](OrtEp* this_ptr, const OrtGraph**, const OrtNode**, size_t, OrtNodeComputeInfo**,
+                         OrtNode**) noexcept -> ::OrtStatus* {
+      auto* test_ort_ep = static_cast<test_plugin_ep::TestOrtEp*>(this_ptr);
+      return test_ort_ep->ort_api->CreateStatus(ORT_FAIL, "Test EP stops after ORT determines the dependencies.");
+    };
+    ort_ep->ReleaseNodeComputeInfos = [](OrtEp*, OrtNodeComputeInfo**, size_t) noexcept {};
+
+    {
+      PluginExecutionProvider ep(UniqueOrtEp(ort_ep.release(), OrtEpDeleter{test_plugin_ep::g_test_ort_ep_factory}),
+                                 *static_cast<const OrtSessionOptions*>(session_options),
+                                 test_plugin_ep::g_test_ort_ep_factory, ep_devices, /*kernel_registry*/ nullptr,
+                                 *logger);
+      std::vector<NodeComputeInfo> node_compute_infos;
+      Status status =
+          ep.Compile({IExecutionProvider::FusedNodeAndGraph{fused_node, graph_viewer}}, node_compute_infos);
+      ASSERT_FALSE(status.IsOK());
+      ASSERT_THAT(status.ErrorMessage(), ::testing::HasSubstr("Test EP stops after ORT determines the dependencies."));
+      dependencies = ep.GetEpContextExternalDependencies();
+    }
+    messages = sink->Messages();
+  };
+
+  auto has_warning = [](const std::vector<std::string>& messages) {
+    return std::any_of(messages.begin(), messages.end(), [](const std::string& message) {
+      return message.find("[W:") != std::string::npos &&
+             message.find(
+                 "1 constant initializers of the nodes compiled by EP 'TestOrtEp' (e.g., 'W') are not in the "
+                 "source model") != std::string::npos;
+    });
+  };
+
+  // W is in the source model: the EP depends on it, and there's no warning.
+  {
+    IExecutionProvider::EpContextExternalDependencies dependencies;
+    std::vector<std::string> messages;
+    ASSERT_NO_FATAL_FAILURE(compile(Origin::kModel, dependencies, messages));
+    EXPECT_TRUE(dependencies.source_model);
+    EXPECT_FALSE(has_warning(messages));
+  }
+
+  // W was created, or rewritten under the same name, after loading: it's not in the source model.
+  for (Origin origin : {Origin::kAddedAfterLoad, Origin::kReplacedAfterLoad}) {
+    SCOPED_TRACE(origin == Origin::kAddedAfterLoad ? "added after load" : "replaced after load");
+    IExecutionProvider::EpContextExternalDependencies dependencies;
+    std::vector<std::string> messages;
+    ASSERT_NO_FATAL_FAILURE(compile(origin, dependencies, messages));
+    EXPECT_FALSE(dependencies.source_model);
+    EXPECT_FALSE(dependencies.external_weights);
+    EXPECT_TRUE(has_warning(messages));
+  }
+}
+
 TEST(PluginExecutionProviderTest, IsConcurrentRunSupported) {
   auto [ep, ort_ep] = test_plugin_ep::MakeTestOrtEp();
 
