@@ -1129,8 +1129,9 @@ Status PluginExecutionProvider::Compile(const std::vector<FusedNodeAndGraph>& fu
           << "Weightless mode requested (" << requested_option << ") but " << num_generated_initializers
           << " constant initializers of the nodes compiled by EP '" << Type() << "' (e.g., '"
           << generated_initializer_example << "') are not in the source model: they were created by ORT after "
-          << "loading the source model, e.g., by constant folding or the layout transformation, or their data was "
-          << "provided with AddExternalInitializers. The EP obtains "
+          << "loading the source model, e.g., by constant folding or the layout transformation, their data was "
+          << "provided with AddExternalInitializers, or they were added as internal data with the OrtModelEditorApi. "
+          << "The EP obtains "
           << "them itself (drop_constant_initializers is true), so it must embed them in the EPContext model: "
           << "references to them can't be resolved from the source model at runtime. Consider compiling with "
           << "graph optimizations disabled.";

@@ -1382,13 +1382,15 @@ typedef struct OrtEnvCreationOptions {
  * \note Future versions may add values. EPs should handle values they don't recognize like
  *       OrtInitializerSourceModelLocation_NONE.
  *
- * \since Version 1.32.
+ * \since Version 1.33.
  */
 typedef enum OrtInitializerSourceModelLocation {
   /** Not an initializer from the source model: not an initializer, or an initializer that ORT created or rewrote after
    *  loading the source model (e.g., by constant folding or the layout transformation), an initializer created from a
-   *  'Constant' node or a sparse initializer of the source model, or an initializer whose data the application
-   *  replaced via AddExternalInitializers, since that data is not guaranteed to match the source model's. */
+   *  'Constant' node or a sparse initializer of the source model, an initializer whose data the application replaced
+   *  via AddExternalInitializers, since that data is not guaranteed to match the source model's, an initializer whose
+   *  external data entries the source model doesn't declare validly, or an initializer that the application adds as
+   *  internal data with the OrtModelEditorApi, since there is no source model file to resolve it from. */
   OrtInitializerSourceModelLocation_NONE = 0,
 
   /** An initializer stored inside the source model's ONNX file. */
@@ -7829,7 +7831,7 @@ struct OrtApi {
    *
    * \note Returns ORT_NOT_IMPLEMENTED in minimal builds.
    *
-   * \since Version 1.32.
+   * \since Version 1.33.
    */
   ORT_API2_STATUS(ValueInfo_GetSourceModelLocation, _In_ const OrtValueInfo* value_info,
                   _Out_ OrtInitializerSourceModelLocation* location);
@@ -7850,7 +7852,7 @@ struct OrtApi {
    * ValueInfo_GetExternalInitializerInfo(). When the application provides the external data files in memory
    * (AddExternalInitializersFromFilesInMemory), ValueInfo_GetExternalInitializerInfo() returns NULL, but this function
    * still returns the declared file path, offset and byte size. The file path is the 'location' entry of the source
-   * model, as declared (relative to the source model's directory unless absolute).
+   * model, as declared, which is relative to the source model's directory (ORT rejects absolute external data paths).
    *
    * Supports initializers defined in an outer scope (i.e., a parent graph).
    *
@@ -7862,7 +7864,7 @@ struct OrtApi {
    *
    * \note Returns ORT_NOT_IMPLEMENTED in minimal builds.
    *
-   * \since Version 1.32.
+   * \since Version 1.33.
    */
   ORT_API2_STATUS(ValueInfo_GetSourceModelExternalDataInfo, _In_ const OrtValueInfo* value_info,
                   _Outptr_result_maybenull_ OrtExternalInitializerInfo** info);

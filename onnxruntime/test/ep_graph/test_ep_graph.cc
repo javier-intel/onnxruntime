@@ -587,8 +587,9 @@ TEST(EpGraphTest, SourceModelProvenance_Subgraphs) {
                    std::nullopt);
 }
 
-// The initializers of a model created with the OrtModelEditorApi are the model's initializers. The ones whose data the
-// application adds as external data are external, without a declared file.
+// A model created with the OrtModelEditorApi has no source model file. The initializers whose data the application
+// adds as external data are external, without a declared file. The internal ones are not from the source model, since
+// there is nothing to resolve them from.
 TEST(EpGraphTest, SourceModelProvenance_ModelEditorApiModel) {
   const logging::Logger& logger = DefaultLoggingManager().DefaultLogger();
   ModelEditorGraph editor_graph;
@@ -642,7 +643,7 @@ TEST(EpGraphTest, SourceModelProvenance_ModelEditorApiModel) {
   ASSERT_STATUS_OK(EpGraph::Create(graph_viewer, ep_graph));
   Ort::ConstGraph graph{ep_graph.get()};
 
-  ExpectProvenance(graph, "internal", OrtInitializerSourceModelLocation_INTERNAL, std::nullopt, std::nullopt);
+  ExpectProvenance(graph, "internal", OrtInitializerSourceModelLocation_NONE, std::nullopt, std::nullopt);
   ExpectProvenance(graph, "external", OrtInitializerSourceModelLocation_EXTERNAL, std::nullopt, std::nullopt);
 }
 

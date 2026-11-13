@@ -296,7 +296,8 @@ depends on, such as the layout transformation.
 | Created from a `Constant` node of the source model | `_NONE` | NULL | NULL |
 | Data replaced with `AddExternalInitializers` | `_NONE` | NULL | NULL (data in memory) |
 | Added as external data with the `OrtModelEditorApi` (application memory) | `_EXTERNAL` | NULL (no declared file) | NULL |
-| Added as internal data with the `OrtModelEditorApi` | `_INTERNAL` | NULL | NULL |
+| Added as internal data with the `OrtModelEditorApi` (no source model file to resolve it from) | `_NONE` | NULL | NULL |
+| Declared in external data entries that ORT can't parse | `_NONE` | NULL | NULL |
 | Created or rewritten by ORT (constant folding, layout transformation, ...) | `_NONE` | NULL | Current location, if any |
 
 `Constant` nodes are `_NONE` because the source model stores their data in node attributes, not in initializers.

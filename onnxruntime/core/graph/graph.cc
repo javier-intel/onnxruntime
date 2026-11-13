@@ -1341,23 +1341,32 @@ Graph::Graph(const Model& owning_model,
     model_initializer_names_.reserve(graph_proto_->initializer_size());
     InlinedHashMap<PathString, uint32_t> path_indices;
     for (const auto& tensor : graph_proto_->initializer()) {
-      model_initializer_names_.insert(tensor.name());
-      if (!utils::HasExternalDataInFile(tensor)) {
+      // Data referenced by an ORT in-memory address marker is not in any model file (only GraphProtos that ORT builds
+      // in memory can carry these markers), so it can't be resolved from the source model.
+      if (utils::HasExternalDataInMemory(tensor)) {
         continue;
       }
 
-      ModelExternalDataLocation location{kNoDeclaredFile, 0, 0};
-      std::unique_ptr<ExternalDataInfo> external_data_info;
-      if (ExternalDataInfo::Create(tensor.external_data(), external_data_info).IsOK()) {
-        auto [it, inserted] = path_indices.emplace(external_data_info->GetRelPath(),
-                                                   narrow<uint32_t>(model_external_data_paths_.size()));
-        if (inserted) {
-          model_external_data_paths_.push_back(external_data_info->GetRelPath());
-        }
-        location = {it->second, static_cast<int64_t>(external_data_info->GetOffset()),
-                    external_data_info->GetLength()};
+      if (!utils::HasExternalDataInFile(tensor)) {
+        model_initializer_names_.insert(tensor.name());
+        continue;
       }
-      model_external_data_locations_.insert_or_assign(tensor.name(), location);
+
+      // Without a valid declared location, the data can't be resolved from the source model either.
+      std::unique_ptr<ExternalDataInfo> external_data_info;
+      if (!ExternalDataInfo::Create(tensor.external_data(), external_data_info).IsOK()) {
+        continue;
+      }
+
+      auto [it, inserted] = path_indices.emplace(external_data_info->GetRelPath(),
+                                                 narrow<uint32_t>(model_external_data_paths_.size()));
+      if (inserted) {
+        model_external_data_paths_.push_back(external_data_info->GetRelPath());
+      }
+      model_initializer_names_.insert(tensor.name());
+      model_external_data_locations_.insert_or_assign(
+          tensor.name(), ModelExternalDataLocation{it->second, static_cast<int64_t>(external_data_info->GetOffset()),
+                                                   external_data_info->GetLength()});
     }
   }
 
@@ -7427,11 +7436,11 @@ Status Graph::LoadFromModelEditorApiModel(const OrtGraph& api_graph, bool updati
 
       name_to_initial_tensor_.emplace(name, &tensor_proto);
 
-      // The initializers of an OrtModel are the model's initializers. Data the application provides as external
-      // (memory that ORT doesn't own) corresponds to external data.
-      model_initializer_names_.insert(name);
+      // An OrtModel has no source model file. Data the application provides as external (memory that ORT doesn't
+      // own) corresponds to external data, without a declared file. Internal data is copied into the model, so there's
+      // nothing to resolve it from: it's not treated as the model's (OrtInitializerSourceModelLocation_NONE).
       if (is_external) {
-        // There's no declared file: the data is in the application's memory.
+        model_initializer_names_.insert(name);
         model_external_data_locations_.insert_or_assign(name, ModelExternalDataLocation{kNoDeclaredFile, 0, 0});
       }
     }

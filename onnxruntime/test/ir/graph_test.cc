@@ -2141,8 +2141,9 @@ TEST_F(GraphTest, InitializersFromModel) {
   EXPECT_FALSE(graph.IsExternalInitializerFromModel("internal"));
 }
 
-// Test that the initializers of a model created with the OrtModelEditorApi are tracked as the model's initializers,
-// with the ones whose data the application provides as external tracked as external.
+// Test that the initializers of a model created with the OrtModelEditorApi whose data the application provides as
+// external are tracked as the model's external initializers. The internal ones are not, since there is no source model
+// file to resolve them from.
 TEST_F(GraphTest, InitializersFromModelEditorApiModel) {
   ModelEditorGraph editor_graph;
   const TensorShape shape{2};
@@ -2177,10 +2178,49 @@ TEST_F(GraphTest, InitializersFromModelEditorApiModel) {
   ASSERT_STATUS_OK(Graph::LoadFromModelEditorApiModel(editor_graph, model, model.MainGraph().DomainToVersionMap(),
                                                       nullptr, false, *logger_, graph));
 
-  EXPECT_TRUE(graph->IsInitializerFromModel("internal"));
+  EXPECT_FALSE(graph->IsInitializerFromModel("internal"));
   EXPECT_FALSE(graph->IsExternalInitializerFromModel("internal"));
   EXPECT_TRUE(graph->IsInitializerFromModel("external"));
   EXPECT_TRUE(graph->IsExternalInitializerFromModel("external"));
+}
+
+// Test that an initializer whose external data entries can't be parsed is not tracked as one of the model's
+// initializers, since its data can't be resolved from the model.
+TEST_F(GraphTest, InitializersFromModelWithInvalidExternalData) {
+  ONNX_NAMESPACE::ModelProto model_proto;
+  model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+  auto* opset = model_proto.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(13);
+  auto* graph_proto = model_proto.mutable_graph();
+  graph_proto->set_name("graph");
+
+  auto* initializer = graph_proto->add_initializer();
+  initializer->set_name("invalid_external");
+  initializer->set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+  initializer->add_dims(4);
+  initializer->set_data_location(ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL);
+  SetTensorProtoExternalData("location", "external_data.bin", *initializer);
+  SetTensorProtoExternalData("offset", "not_a_number", *initializer);  // ExternalDataInfo::Create() fails.
+  SetTensorProtoExternalData("length", "16", *initializer);
+  auto* output = graph_proto->add_output();
+  output->set_name("invalid_external");
+  output->mutable_type()->mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+
+  std::shared_ptr<Model> model;
+  ASSERT_STATUS_OK(Model::Load(std::move(model_proto), model, nullptr, *logger_));
+  const Graph& graph = model->MainGraph();
+
+  const TensorProto* tensor = nullptr;
+  ASSERT_TRUE(graph.GetInitializedTensor("invalid_external", tensor));
+  ASSERT_NE(tensor, nullptr);
+  ASSERT_TRUE(utils::HasExternalDataInFile(*tensor));
+
+  EXPECT_FALSE(graph.IsInitializerFromModel("invalid_external"));
+  EXPECT_FALSE(graph.IsExternalInitializerFromModel("invalid_external"));
+  std::unique_ptr<ExternalDataInfo> declared;
+  EXPECT_FALSE(graph.GetSourceModelExternalDataInfo("invalid_external", declared));
+  EXPECT_EQ(declared, nullptr);
 }
 
 TEST_F(GraphTest, InjectExternalInitializedTensors) {

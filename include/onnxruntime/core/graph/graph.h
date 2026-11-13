@@ -852,8 +852,11 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   /// Checks whether an initializer holds the data it had in the model this Graph was loaded from, i.e., whether it
   /// is one of the initializers listed in the model's GraphProto and hasn't been removed or replaced since. Returns
   /// false for initializers that ORT created after loading, e.g., by constant folding or other graph optimizations,
-  /// or that it rewrote, e.g., the initializers the layout transformation transposes. Initializers created from
-  /// 'Constant' nodes or sparse initializers of the model are not listed in its GraphProto's initializers either.
+  /// or that it rewrote, e.g., the initializers the layout transformation transposes, or whose data the application
+  /// replaced (AddExternalInitializers). Initializers created from 'Constant' nodes or sparse initializers of the model
+  /// are not listed in its GraphProto's initializers either. Initializers whose data can't be resolved from a model
+  /// file are excluded too: those referencing ORT in-memory address markers, those with invalid external data entries,
+  /// and the internal initializers of a model created with the OrtModelEditorApi.
   /// </summary>
   /// <param name="name">The initializer's name.</param>
   /// <param name="check_outer_scope">Set to true if parent graphs should be checked.</param>
@@ -2105,8 +2108,9 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
 
 #if !defined(ORT_MINIMAL_BUILD)
   // Names of the initializers listed in the GraphProto this Graph was created from that still hold their original
-  // data. A name is removed when the initializer is removed, since an initializer added later under the same name
-  // (e.g., by the layout transformation) holds different data. See IsInitializerFromModel().
+  // data and can be resolved from the model (see IsInitializerFromModel() for the exclusions). A name is removed when
+  // the initializer is removed, since an initializer added later under the same name (e.g., by the layout
+  // transformation) holds different data.
   InlinedHashSet<std::string> model_initializer_names_;
 
   // Where the model declared the data of the initializers in model_initializer_names_ that it stored outside its
@@ -2115,7 +2119,7 @@ class Graph {  // NOLINT(clang-analyzer-optin.performance.Padding): preserve exi
   // stored once in model_external_data_paths_, since a model's external initializers usually share a few files.
   struct ModelExternalDataLocation {
     // Index into model_external_data_paths_, or kNoDeclaredFile if the model didn't declare a file (data provided
-    // in memory with the OrtModelEditorApi, or external data entries that can't be parsed).
+    // in memory with the OrtModelEditorApi).
     uint32_t path_index;
     int64_t offset;
     size_t length;
