@@ -2223,6 +2223,41 @@ TEST_F(GraphTest, InitializersFromModelWithInvalidExternalData) {
   EXPECT_EQ(declared, nullptr);
 }
 
+// Test that an initializer of a GraphProto that carries an ORT in-memory address marker is never tracked as one of the
+// model's initializers (OrtInitializerSourceModelLocation_NONE): its data is not in any model file. Only GraphProtos
+// that ORT builds in memory can carry these markers, and the Graph ctor rejects them on load, so no Graph that
+// reports provenance for such an initializer is ever created. The provenance recording also skips them in case the
+// rejection is relaxed.
+TEST_F(GraphTest, InitializersFromModelWithInMemoryAddressMarker) {
+  ONNX_NAMESPACE::ModelProto model_proto;
+  model_proto.set_ir_version(ONNX_NAMESPACE::Version::IR_VERSION);
+  auto* opset = model_proto.add_opset_import();
+  opset->set_domain("");
+  opset->set_version(13);
+  auto* graph_proto = model_proto.mutable_graph();
+  graph_proto->set_name("graph");
+
+  static std::vector<int32_t> backing(4, 0);
+  auto* initializer = graph_proto->add_initializer();
+  initializer->set_name("in_memory_marker");
+  initializer->set_data_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+  initializer->add_dims(static_cast<int64_t>(backing.size()));
+  initializer->set_data_location(ONNX_NAMESPACE::TensorProto_DataLocation_EXTERNAL);
+  SetTensorProtoExternalData("location", ToUTF8String(utils::kTensorProtoNativeEndianMemoryAddressTag), *initializer);
+  SetTensorProtoExternalData("offset", std::to_string(reinterpret_cast<intptr_t>(backing.data())), *initializer);
+  SetTensorProtoExternalData("length", std::to_string(backing.size() * sizeof(int32_t)), *initializer);
+  ASSERT_TRUE(utils::HasExternalDataInMemory(*initializer));
+  auto* output = graph_proto->add_output();
+  output->set_name("in_memory_marker");
+  output->mutable_type()->mutable_tensor_type()->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_INT32);
+
+  std::shared_ptr<Model> model;
+  auto status = Model::Load(std::move(model_proto), model, nullptr, *logger_);
+  ASSERT_FALSE(status.IsOK()) << "A GraphProto with an in-memory address marker must not produce a Graph.";
+  EXPECT_THAT(status.ErrorMessage(), ::testing::HasSubstr("in-memory address marker"));
+  EXPECT_EQ(model, nullptr);
+}
+
 TEST_F(GraphTest, InjectExternalInitializedTensors) {
   const std::string initializer_name = "test_external_initializer";
 
