@@ -18,6 +18,12 @@
  */
 struct ExampleExternalMemoryHandle : OrtExternalMemoryHandle {
   std::unique_ptr<char[]> simulated_ptr;  ///< Simulated mapped pointer (CPU memory for testing)
+  /// For ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION: the imported host memory, which this example EP's (CPU)
+  /// device accesses in place, as a UMA device does. Not owned: releasing the import doesn't free it.
+  char* host_ptr = nullptr;
+
+  /// Address of the imported memory as seen by the device.
+  char* mapped_ptr() const { return host_ptr != nullptr ? host_ptr : simulated_ptr.get(); }
 
   ExampleExternalMemoryHandle(const OrtExternalMemoryDescriptor& descriptor_in)
       : simulated_ptr(nullptr) {

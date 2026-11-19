@@ -259,6 +259,30 @@ const char* ORT_API_CALL ExampleEp ::GetNameImpl(const OrtEp* this_ptr) noexcept
 }
 
 /*static*/
+ExampleEp::~ExampleEp() {
+  // The application keeps the memory it supplied for a source model data file valid while the session may use it.
+  // Record its checksum when the EP is released, so tests can check it was still valid then.
+  if (source_model_data_file_.has_value()) {
+    RecordSourceModelDataFileRelease(source_model_data_file_->data(), source_model_data_file_->size());
+  }
+}
+
+OrtStatus* ExampleEp::ReadSourceModelDataFileOnce() {
+  if (config_.test_source_model_data_file.empty() || source_model_data_file_.has_value()) {
+    return nullptr;
+  }
+
+  // A real EP gets the declared location from the source model's external_data entries, finds each initializer at
+  // its declared offset, and may cache the file for the session, as here, or read it again per compiled partition.
+  ep_context_data_utils::SourceModelDataFile data_file;
+  RETURN_IF_ERROR(ep_context_data_utils::ReadSourceModelDataFile(ort_api, ep_context_config_,
+                                                                 config_.test_source_model_data_file.c_str(),
+                                                                 config_.source_model_data_dir, data_file));
+  RecordSourceModelDataFileRead(data_file.data(), data_file.size(), data_file.supplied_by_application());
+  source_model_data_file_ = std::move(data_file);
+  return nullptr;
+}
+
 OrtStatus* ORT_API_CALL ExampleEp::GetWeightlessSupportImpl(const OrtEp* this_ptr,
                                                             OrtWeightlessSupport* support) noexcept {
   const auto* ep = static_cast<const ExampleEp*>(this_ptr);
@@ -496,6 +520,10 @@ OrtStatus* ORT_API_CALL ExampleEp::CompileImpl(_In_ OrtEp* this_ptr, _In_ const 
     auto fused_node_name = fused_node.GetName();
 
     if (is_ep_context_node) {
+      // Read the source model data file a test asked for, as an EP that rebuilds the source model of a weightless
+      // EPContext model does.
+      RETURN_IF_ERROR(ep->ReadSourceModelDataFileOnce());
+
       auto kernel = std::make_unique<EpContextKernel>(ep->ort_api, ep->logger_);
       Ort::ConstOpAttr embed_mode_attr;
       RETURN_IF_ERROR(nodes[0].GetAttributeByName("embed_mode", embed_mode_attr));

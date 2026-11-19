@@ -327,7 +327,7 @@ memory. The declared file path is the source model's `location` entry, relative 
 | **Compile time:** external initializers file (`"ep.context_model_external_initializers_file_name"` or `SetOutputModelExternalInitializersFile`) | Optional | **Required** | **Required** |
 | **Runtime:** compiled model (`*_ctx.onnx`) and EP context binary (if `ep_cache_context` is stored in a separate file, `embed_mode = 0`) | Required | Required | Required |
 | **Runtime:** compiled model's external initializers file | Only if one was generated | **Required** (ORT-provided) | **Required** (ORT-provided) |
-| **Runtime:** source model's external data files | Not used | **Required** (EP-managed) | **Required** (EP-managed) |
+| **Runtime:** source model's external data files (on disk, or supplied with the read callback, see below) | Not used | **Required** (EP-managed) | **Required** (EP-managed) |
 | **Runtime:** source model `.onnx` (`"ep.context_source_model_path"`, source model buffer, or `"onnx_model_filename"`) | Not used | Not used | **Required** (EP-managed) |
 
 "(ORT-provided)" and "(EP-managed)" mark what is strictly needed by EPs that use that strategy. An application
@@ -373,6 +373,130 @@ Ort::Session session(env, ORT_TSTR("C:/models/model_ctx.onnx"), session_options)
 
 When the EP context binary is stored in a separate file (`embed_mode = 0`) and the compiled model is loaded
 from memory, or its location is overridden, also set `"ep.context_file_path"` so the binary can be found.
+
+**Supplying the source model's external data files with the read callback.** An application that keeps the source
+model's external data files in memory, or encrypted, can supply them with the EPContext read callback it already uses
+for EPContext data (`OrtApi::SessionOptionsSetEpContextDataReadFunc`). ORT doesn't call the callback for these files
+itself: an EP that supports `OrtEpContextDataCallbackSupportFlags_READ` may call it, with the callback it gets from
+`OrtEpContextConfig`, while it imports a weightless EPContext model and rebuilds the source model.
+
+- `name` is the file's `location` as declared in the source model's `external_data` entries, relative to the source
+  model's directory, normalized with `/` separators (e.g., `weights/model.data`).
+- The callback returns the whole file. The EP finds each initializer at its declared offset.
+- An empty result (`buffer == NULL`, `data_size == 0`) means the application doesn't supply that file: the EP reads it
+  from the file system (the source model's directory, or `"session.model_external_initializers_file_folder_path"`).
+  For EPContext data, an empty result keeps its meaning.
+- Returning an error status fails session creation.
+- The EP may call the callback once per file per compiled partition, or cache the result for the session.
+- The application must ensure these names don't collide with the EPContext data names (`ep_cache_context` of the
+  EPContext nodes) of the same model. Name them distinctly, or place the data files in a subdirectory.
+
+**Ownership of the returned memory.** *This rule is provisional: it lets the overall design be tested, and may be
+replaced.* The rule depends on what is read:
+
+| Data read | Memory returned by the callback | Freed by |
+|---|---|---|
+| EPContext data | Allocated with the `allocator` argument | The consumer, with that allocator |
+| Source model data file | Memory the application owns; `allocator` is not used | The application, after the session no longer uses it |
+
+When the callback is asked for a source model data file, it returns memory the application owns, and the consumer
+never frees it, so the application can avoid copying multi-GB weight files. The memory must stay valid while the
+session may use it, which can extend to the last inference. `state` can hold the application's record of the buffers
+it returned.
+
+To avoid a copy into device-visible memory, the application can import the memory into the calling EP:
+
+- import it with `OrtInteropApi::ImportMemory` (`ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION`), using an importer
+  created for the session's EP device (`CreateExternalResourceImporterForDevice`);
+- create a tensor over it with `CreateTensorFromMemory`;
+- return that tensor's data pointer (`GetTensorMutableData`) and size. This is the address that results from the
+  import, which can differ from the application's host pointer, so the tensor is required.
+
+After the last inference, the application releases the tensor (`ReleaseValue`) and the memory handle
+(`ReleaseExternalMemoryHandle`), before or after releasing the session, and frees its host memory last. Releasing an
+import doesn't free the host memory.
+
+- Host memory imports require the address and size alignment the EP documents (page-aligned for the OpenVINO EP), and
+  are supported on devices whose memory the host can access (UMA devices such as NPUs and integrated GPUs).
+- The import must be made with an importer for the EP device that calls the callback.
+
+The example below imports a weightless EPContext model without any weights on disk: the source model comes from a
+buffer (`SessionOptionsSetWeightlessSourceModelBuffer`) and its external data file from the read callback.
+
+```cpp
+struct AppData {
+  std::vector<char> ep_context_data;  // EPContext data of the compiled model (embed_mode = 0).
+  const void* weights = nullptr;      // "weights/model.data": application memory, or the imported address.
+  size_t weights_size = 0;
+};
+
+OrtStatus* ORT_API_CALL ReadData(void* state, const char* name, OrtAllocator* allocator, void** buffer,
+                                 size_t* data_size) {
+  auto& app = *static_cast<AppData*>(state);
+  *buffer = nullptr;
+  *data_size = 0;
+  if (std::strcmp(name, "weights/model.data") == 0) {
+    // Source model data file: application memory, never freed by the consumer. `allocator` is not used.
+    *buffer = const_cast<void*>(app.weights);
+    *data_size = app.weights_size;
+    return nullptr;
+  }
+  if (std::strcmp(name, "model_ctx.bin") == 0) {
+    // EPContext data: allocated with `allocator`, freed by the consumer.
+    OrtStatus* status = Ort::GetApi().AllocatorAlloc(allocator, app.ep_context_data.size(), buffer);
+    if (status != nullptr) return status;
+    std::memcpy(*buffer, app.ep_context_data.data(), app.ep_context_data.size());
+    *data_size = app.ep_context_data.size();
+    return nullptr;
+  }
+  return nullptr;  // Not supplied: the EP reads the file from the file system.
+}
+
+// Page-aligned host memory holding the decrypted "weights/model.data".
+void* host_weights = /* ... */;
+size_t host_weights_size = /* ... */;
+
+// Optional: import the memory into the EP device, so the EP uses it without a copy.
+const OrtInteropApi& interop = Ort::GetInteropApi();
+OrtExternalResourceImporter* importer = nullptr;
+Ort::ThrowOnError(interop.CreateExternalResourceImporterForDevice(ep_device, &importer));
+OrtExternalMemoryDescriptor memory_desc{};
+memory_desc.version = ORT_API_VERSION;
+memory_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION;
+memory_desc.native_handle = host_weights;
+memory_desc.size_bytes = host_weights_size;
+OrtExternalMemoryHandle* memory_handle = nullptr;
+Ort::ThrowOnError(interop.ImportMemory(importer, &memory_desc, &memory_handle));
+const int64_t shape[] = {static_cast<int64_t>(host_weights_size)};
+OrtExternalTensorDescriptor tensor_desc{};
+tensor_desc.version = ORT_API_VERSION;
+tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+tensor_desc.shape = shape;
+tensor_desc.rank = 1;
+OrtValue* weights_tensor = nullptr;
+Ort::ThrowOnError(interop.CreateTensorFromMemory(importer, memory_handle, &tensor_desc, &weights_tensor));
+
+AppData app;
+app.ep_context_data = /* ... */;
+Ort::ThrowOnError(Ort::GetApi().GetTensorMutableData(weights_tensor, const_cast<void**>(&app.weights)));
+app.weights_size = host_weights_size;  // Or host_weights and host_weights_size without the import.
+
+Ort::SessionOptions session_options;
+session_options.AppendExecutionProvider_V2(env, {ep_device}, ep_options);
+Ort::ThrowOnError(Ort::GetApi().SessionOptionsSetWeightlessSourceModelBuffer(
+    session_options, source_model_bytes.data(), source_model_bytes.size()));
+session_options.SetEpContextDataReadFunc(ReadData, &app);
+{
+  Ort::Session session(env, compiled_model_bytes.data(), compiled_model_bytes.size(), session_options);
+  // ... inferences ...
+}
+
+// After the last inference: release the tensor and the import, then free the host memory.
+Ort::GetApi().ReleaseValue(weights_tensor);
+interop.ReleaseExternalMemoryHandle(memory_handle);
+interop.ReleaseExternalResourceImporter(importer);
+FreeHostWeights(host_weights);
+```
 
 ### 4.3 Packaging
 
@@ -444,3 +568,8 @@ inside the variant directory under that name.
    warns about them in `ALL` mode, for EP-managed initializers; it can't check whether the EP embeds them or keeps
    references that fail at runtime. Initializers that ORT creates from `Constant` nodes or sparse initializers of
    the source model are treated the same way, since the source model doesn't list them as initializers.
+5. **Ownership of source model data files read with the callback is provisional.** The read callback returns
+   application-owned memory for the source model's external data files, but allocator memory freed by the consumer
+   for EPContext data (see [4.2](#42-requirements-per-mode)). This is a temporary rule to test the overall design.
+   The callback has no way to tell which kind of data is requested other than by `name`, and the application is
+   responsible for keeping both kinds of names distinct.

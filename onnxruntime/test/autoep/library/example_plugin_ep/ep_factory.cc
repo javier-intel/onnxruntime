@@ -384,6 +384,28 @@ OrtStatus* ORT_API_CALL ExampleEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
                                                 false, config.test_read_ep_context_during_compile));
   RETURN_IF_ERROR(GetSessionConfigBoolOrDefault(*session_options, "ep.example.test_execute_ep_context",
                                                 false, config.test_execute_ep_context));
+  RETURN_IF_ERROR(GetSessionConfigEntryOrDefault(*session_options, kExampleEpTestSourceModelDataFile, "",
+                                                 config.test_source_model_data_file));
+  if (!config.test_source_model_data_file.empty()) {
+    // The source model's external data files are in "session.model_external_initializers_file_folder_path" if set,
+    // otherwise next to the source model.
+    std::string folder_path;
+    RETURN_IF_ERROR(GetSessionConfigEntryOrDefault(*session_options,
+                                                   kOrtSessionOptionsModelExternalInitializersFileFolderPath, "",
+                                                   folder_path));
+    std::string source_model_path;
+    RETURN_IF_ERROR(GetSessionConfigEntryOrDefault(*session_options, kOrtSessionOptionEpContextSourceModelPath, "",
+                                                   source_model_path));
+    std::filesystem::path dir;
+    RETURN_IF_ERROR(ep_context_data_utils::Utf8Path(factory->ort_api,
+                                                    !folder_path.empty() ? folder_path.c_str()
+                                                                         : source_model_path.c_str(),
+                                                    dir));
+    if (folder_path.empty() && !dir.empty()) {
+      dir = dir.has_parent_path() ? dir.parent_path() : std::filesystem::path{"."};
+    }
+    config.source_model_data_dir = dir;
+  }
 
   std::string test_weightless_support;
   RETURN_IF_ERROR(GetSessionConfigEntryOrDefault(*session_options, kExampleEpTestWeightlessSupport, "",

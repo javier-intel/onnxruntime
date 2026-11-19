@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1024,6 +1027,342 @@ TEST(OrtEpLibrary, PluginEp_LoadEpContextModel_ExternalDataUsesReadCallback) {
 
   ASSERT_TRUE(read_callback_state.read_called);
   EXPECT_EQ(read_callback_state.read_file_name, write_callback_state.write_file_name);
+}
+
+namespace {
+
+// Name of the source model data file the example EP reads with the read callback. It's in a subdirectory, so it
+// doesn't collide with the EPContext data names of the compiled model.
+constexpr const char* kSourceModelDataFileName = "weights/source_model.data";
+constexpr size_t kSourceModelDataSize = 2 * 4096;
+
+// Read callback state of an application that supplies both the EPContext data of a compiled model (allocator memory
+// freed by the consumer) and a source model data file (memory the application owns).
+struct SourceModelDataReadState {
+  EpContextDataCallbackState ep_context;  // EPContext data.
+  const void* source_model_data = nullptr;
+  size_t source_model_data_size = 0;
+  bool fail_source_model_data_read = false;
+  std::vector<std::string> names;
+};
+
+OrtStatus* ORT_API_CALL ReadSourceModelDataOrEpContextData(void* state, const char* name, OrtAllocator* allocator,
+                                                           void** buffer, size_t* data_size) {
+  auto& read_state = *static_cast<SourceModelDataReadState*>(state);
+  read_state.names.emplace_back(name);
+  if (std::strcmp(name, kSourceModelDataFileName) != 0) {
+    return LoadEpContextDataCallback(&read_state.ep_context, name, allocator, buffer, data_size);
+  }
+
+  if (read_state.fail_source_model_data_read) {
+    return Ort::GetApi().CreateStatus(ORT_FAIL, "The application failed to read the source model data file.");
+  }
+
+  // Application-owned memory: the consumer never frees it, and the allocator is not used. NULL and 0 mean the
+  // application doesn't supply the file.
+  *buffer = const_cast<void*>(read_state.source_model_data);
+  *data_size = read_state.source_model_data_size;
+  return nullptr;
+}
+
+// Page-aligned host memory owned by the application, as required for ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION.
+struct AlignedHostMemoryDeleter {
+  void operator()(char* p) const { ::operator delete[](p, std::align_val_t{4096}); }
+};
+using AlignedHostMemory = std::unique_ptr<char[], AlignedHostMemoryDeleter>;
+
+AlignedHostMemory CreateSourceModelData() {
+  AlignedHostMemory data{static_cast<char*>(::operator new[](kSourceModelDataSize, std::align_val_t{4096}))};
+  for (size_t i = 0; i < kSourceModelDataSize; ++i) {
+    data[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+  }
+  return data;
+}
+
+std::vector<char> ExpectedSourceModelData() {
+  std::vector<char> data(kSourceModelDataSize);
+  for (size_t i = 0; i < kSourceModelDataSize; ++i) {
+    data[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+  }
+  return data;
+}
+
+uint64_t Fnv1a(const void* data, size_t size) {
+  uint64_t hash = 14695981039346656037ULL;
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash = (hash ^ bytes[i]) * 1099511628211ULL;
+  }
+  return hash;
+}
+
+struct SourceModelDataFileRecord {
+  uint64_t read_count = 0;
+  const void* data = nullptr;
+  size_t size = 0;
+  int supplied_by_application = -1;
+  uint64_t checksum_at_read = 0;
+  uint64_t checksum_at_release = 0;
+};
+
+SourceModelDataFileRecord GetSourceModelDataFileRecord(const Utils::ExampleEpHooks& hooks) {
+  SourceModelDataFileRecord record;
+  hooks.get_source_model_data_file(&record.read_count, &record.data, &record.size,
+                                            &record.supplied_by_application, &record.checksum_at_read,
+                                            &record.checksum_at_release);
+  return record;
+}
+
+// Compiles testdata/mul_1.onnx with its EPContext data stored with the write callback (embed_mode = 0).
+void CompileWithExternalEpContextData(Ort::ConstEpDevice ep_device, const ORTCHAR_T* compiled_model_file,
+                                      EpContextDataCallbackState& write_callback_state) {
+  Ort::SessionOptions session_options;
+  session_options.AppendExecutionProvider_V2(*ort_env, {ep_device}, std::unordered_map<std::string, std::string>{});
+
+  Ort::ModelCompilationOptions compile_options(*ort_env, session_options);
+  compile_options.SetFlags(OrtCompileApiFlags_ERROR_IF_NO_NODES_COMPILED);
+  compile_options.SetInputModelPath(ORT_TSTR("testdata/mul_1.onnx"));
+  compile_options.SetOutputModelPath(compiled_model_file);
+  compile_options.SetEpContextEmbedMode(false);
+  ASSERT_NO_FATAL_FAILURE(
+      SetEpContextDataWriteFunc(compile_options, StoreEpContextDataCallback, &write_callback_state));
+  ASSERT_CXX_ORTSTATUS_OK(Ort::CompileModel(*ort_env, compile_options));
+  ASSERT_TRUE(write_callback_state.write_called);
+  ASSERT_NE(write_callback_state.write_file_name, kSourceModelDataFileName);
+}
+
+// Creates and releases a session for the compiled model, with the EP reading kSourceModelDataFileName.
+void LoadWithSourceModelDataFile(Ort::ConstEpDevice ep_device, const ORTCHAR_T* compiled_model_file,
+                                 SourceModelDataReadState& read_state,
+                                 const std::filesystem::path& external_data_folder = {}) {
+  Ort::SessionOptions session_options;
+  ASSERT_NO_FATAL_FAILURE(
+      SetEpContextDataReadFunc(session_options, ReadSourceModelDataOrEpContextData, &read_state));
+  session_options.AddConfigEntry(kExampleEpTestSourceModelDataFile, kSourceModelDataFileName);
+  if (!external_data_folder.empty()) {
+    session_options.AddConfigEntry(kOrtSessionOptionsModelExternalInitializersFileFolderPath,
+                                   external_data_folder.string().c_str());
+  }
+  session_options.AppendExecutionProvider_V2(*ort_env, {ep_device}, std::unordered_map<std::string, std::string>{});
+
+  Ort::Session session(*ort_env, compiled_model_file, session_options);
+}
+
+}  // namespace
+
+// The EP reads a source model data file with the read callback, which returns memory the application owns. The EP uses
+// it in place, never frees it, and it stays valid until the session is released. The application frees it afterwards.
+// The EPContext data of the same model is still read into allocator memory, freed by the consumer.
+TEST(OrtEpLibrary, PluginEp_SourceModelDataFile_ApplicationOwnedMemory) {
+  RegisteredEpDeviceUniquePtr example_ep;
+  ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, Utils::example_ep_info, example_ep));
+  Ort::ConstEpDevice plugin_ep_device(example_ep.get());
+  Utils::LoadExampleEpHooksPtr hooks;
+  ASSERT_NO_FATAL_FAILURE(Utils::LoadExampleEpHooks(Utils::example_ep_info, hooks));
+  ASSERT_NE(hooks->reset_source_model_data_file, nullptr);
+  ASSERT_NE(hooks->get_source_model_data_file, nullptr);
+
+  const ORTCHAR_T* compiled_model_file = ORT_TSTR("plugin_ep_mul_1_source_model_data_ctx.onnx");
+  std::filesystem::remove(compiled_model_file);
+  auto cleanup = gsl::finally([&]() { std::filesystem::remove(compiled_model_file); });
+
+  EpContextDataCallbackState write_callback_state;
+  ASSERT_NO_FATAL_FAILURE(CompileWithExternalEpContextData(plugin_ep_device, compiled_model_file,
+                                                           write_callback_state));
+
+  AlignedHostMemory source_model_data = CreateSourceModelData();
+  SourceModelDataReadState read_state;
+  read_state.ep_context.payload = write_callback_state.payload;
+  read_state.source_model_data = source_model_data.get();
+  read_state.source_model_data_size = kSourceModelDataSize;
+
+  hooks->reset_source_model_data_file();
+  ASSERT_NO_FATAL_FAILURE(LoadWithSourceModelDataFile(plugin_ep_device, compiled_model_file, read_state));
+
+  // Both kinds of data were read with the same callback.
+  EXPECT_THAT(read_state.names, ::testing::UnorderedElementsAre(write_callback_state.write_file_name,
+                                                                std::string{kSourceModelDataFileName}));
+  ASSERT_TRUE(read_state.ep_context.read_called);
+  EXPECT_NE(read_state.ep_context.last_read_buffer, nullptr);  // Allocator memory, freed by the consumer.
+
+  // The EP used the application's memory in place, and it was intact when the EP was released.
+  const std::vector<char> expected = ExpectedSourceModelData();
+  const uint64_t expected_checksum = Fnv1a(expected.data(), expected.size());
+  const SourceModelDataFileRecord record = GetSourceModelDataFileRecord(*hooks);
+  EXPECT_EQ(record.read_count, 1u);
+  EXPECT_EQ(record.data, source_model_data.get());
+  EXPECT_EQ(record.size, kSourceModelDataSize);
+  EXPECT_EQ(record.supplied_by_application, 1);
+  EXPECT_EQ(record.checksum_at_read, expected_checksum);
+  EXPECT_EQ(record.checksum_at_release, expected_checksum);
+
+  // The consumer didn't free or modify the memory: the application frees it now, without a double free.
+  EXPECT_EQ(std::memcmp(source_model_data.get(), expected.data(), expected.size()), 0);
+  source_model_data.reset();
+}
+
+// The application imports its memory into the EP (ImportMemory + CreateTensorFromMemory) and returns the address that
+// results from the import. It releases the tensor and the import after the session, then frees its host memory.
+TEST(OrtEpLibrary, PluginEp_SourceModelDataFile_ImportedMemory) {
+  RegisteredEpDeviceUniquePtr example_ep;
+  ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, Utils::example_ep_info, example_ep));
+  Ort::ConstEpDevice plugin_ep_device(example_ep.get());
+  Utils::LoadExampleEpHooksPtr hooks;
+  ASSERT_NO_FATAL_FAILURE(Utils::LoadExampleEpHooks(Utils::example_ep_info, hooks));
+  ASSERT_NE(hooks->reset_source_model_data_file, nullptr);
+  ASSERT_NE(hooks->get_source_model_data_file, nullptr);
+
+  const OrtInteropApi& interop_api = Ort::GetInteropApi();
+  OrtExternalResourceImporter* importer = nullptr;
+  ASSERT_ORTSTATUS_OK(interop_api.CreateExternalResourceImporterForDevice(example_ep.get(), &importer));
+  if (importer == nullptr) {
+    GTEST_SKIP() << "External resource interop not supported";
+  }
+  auto release_importer = gsl::finally([&]() { interop_api.ReleaseExternalResourceImporter(importer); });
+  bool can_import = false;
+  ASSERT_ORTSTATUS_OK(
+      interop_api.CanImportMemory(importer, ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION, &can_import));
+  if (!can_import) {
+    GTEST_SKIP() << "Host memory import not supported";
+  }
+
+  const ORTCHAR_T* compiled_model_file = ORT_TSTR("plugin_ep_mul_1_source_model_data_import_ctx.onnx");
+  std::filesystem::remove(compiled_model_file);
+  auto cleanup = gsl::finally([&]() { std::filesystem::remove(compiled_model_file); });
+
+  EpContextDataCallbackState write_callback_state;
+  ASSERT_NO_FATAL_FAILURE(CompileWithExternalEpContextData(plugin_ep_device, compiled_model_file,
+                                                           write_callback_state));
+
+  AlignedHostMemory host_memory = CreateSourceModelData();
+
+  OrtExternalMemoryDescriptor memory_desc{};
+  memory_desc.version = ORT_API_VERSION;
+  memory_desc.handle_type = ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION;
+  memory_desc.native_handle = host_memory.get();
+  memory_desc.size_bytes = kSourceModelDataSize;
+  memory_desc.offset_bytes = 0;
+  OrtExternalMemoryHandle* memory_handle = nullptr;
+  ASSERT_ORTSTATUS_OK(interop_api.ImportMemory(importer, &memory_desc, &memory_handle));
+  ASSERT_NE(memory_handle, nullptr);
+
+  const int64_t shape[] = {static_cast<int64_t>(kSourceModelDataSize)};
+  OrtExternalTensorDescriptor tensor_desc{};
+  tensor_desc.version = ORT_API_VERSION;
+  tensor_desc.element_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+  tensor_desc.shape = shape;
+  tensor_desc.rank = 1;
+  tensor_desc.offset_bytes = 0;
+  OrtValue* tensor = nullptr;
+  ASSERT_ORTSTATUS_OK(interop_api.CreateTensorFromMemory(importer, memory_handle, &tensor_desc, &tensor));
+  ASSERT_NE(tensor, nullptr);
+  void* imported_data = nullptr;
+  ASSERT_ORTSTATUS_OK(Ort::GetApi().GetTensorMutableData(tensor, &imported_data));
+  ASSERT_NE(imported_data, nullptr);
+
+  SourceModelDataReadState read_state;
+  read_state.ep_context.payload = write_callback_state.payload;
+  read_state.source_model_data = imported_data;
+  read_state.source_model_data_size = kSourceModelDataSize;
+
+  hooks->reset_source_model_data_file();
+  ASSERT_NO_FATAL_FAILURE(LoadWithSourceModelDataFile(plugin_ep_device, compiled_model_file, read_state));
+
+  const std::vector<char> expected = ExpectedSourceModelData();
+  const uint64_t expected_checksum = Fnv1a(expected.data(), expected.size());
+  const SourceModelDataFileRecord record = GetSourceModelDataFileRecord(*hooks);
+  EXPECT_EQ(record.read_count, 1u);
+  EXPECT_EQ(record.data, imported_data);
+  EXPECT_EQ(record.supplied_by_application, 1);
+  EXPECT_EQ(record.checksum_at_read, expected_checksum);
+  EXPECT_EQ(record.checksum_at_release, expected_checksum);
+  EXPECT_TRUE(read_state.ep_context.read_called);
+
+  // After the session: release the tensor and the import, then free the host memory, which the import doesn't free.
+  Ort::GetApi().ReleaseValue(tensor);
+  interop_api.ReleaseExternalMemoryHandle(memory_handle);
+  EXPECT_EQ(std::memcmp(host_memory.get(), expected.data(), expected.size()), 0);
+  host_memory.reset();
+}
+
+// An empty result means the application doesn't supply the file: the EP reads it from the file system. A callback
+// error fails session creation.
+TEST(OrtEpLibrary, PluginEp_SourceModelDataFile_NotSuppliedOrError) {
+  RegisteredEpDeviceUniquePtr example_ep;
+  ASSERT_NO_FATAL_FAILURE(Utils::RegisterAndGetExampleEp(*ort_env, Utils::example_ep_info, example_ep));
+  Ort::ConstEpDevice plugin_ep_device(example_ep.get());
+  Utils::LoadExampleEpHooksPtr hooks;
+  ASSERT_NO_FATAL_FAILURE(Utils::LoadExampleEpHooks(Utils::example_ep_info, hooks));
+  ASSERT_NE(hooks->reset_source_model_data_file, nullptr);
+  ASSERT_NE(hooks->get_source_model_data_file, nullptr);
+
+  const ORTCHAR_T* compiled_model_file = ORT_TSTR("plugin_ep_mul_1_source_model_data_file_ctx.onnx");
+  const std::filesystem::path data_folder = "plugin_ep_source_model_data_folder";
+  std::filesystem::remove(compiled_model_file);
+  std::filesystem::remove_all(data_folder);
+  auto cleanup = gsl::finally([&]() {
+    std::filesystem::remove(compiled_model_file);
+    std::filesystem::remove_all(data_folder);
+  });
+
+  EpContextDataCallbackState write_callback_state;
+  ASSERT_NO_FATAL_FAILURE(CompileWithExternalEpContextData(plugin_ep_device, compiled_model_file,
+                                                           write_callback_state));
+
+  // The source model data file on disk, in "session.model_external_initializers_file_folder_path".
+  const std::vector<char> expected = ExpectedSourceModelData();
+  std::filesystem::create_directories(data_folder / "weights");
+  {
+    std::ofstream file(data_folder / "weights" / "source_model.data", std::ios::binary);
+    file.write(expected.data(), static_cast<std::streamsize>(expected.size()));
+    ASSERT_TRUE(file.good());
+  }
+
+  {
+    // Empty result: not supplied, so the EP reads the file from the folder. EPContext data still comes from the
+    // callback.
+    SourceModelDataReadState read_state;
+    read_state.ep_context.payload = write_callback_state.payload;
+
+    hooks->reset_source_model_data_file();
+    ASSERT_NO_FATAL_FAILURE(LoadWithSourceModelDataFile(plugin_ep_device, compiled_model_file, read_state,
+                                                        data_folder));
+
+    EXPECT_THAT(read_state.names, ::testing::Contains(std::string{kSourceModelDataFileName}));
+    EXPECT_TRUE(read_state.ep_context.read_called);
+    const uint64_t expected_checksum = Fnv1a(expected.data(), expected.size());
+    const SourceModelDataFileRecord record = GetSourceModelDataFileRecord(*hooks);
+    EXPECT_EQ(record.read_count, 1u);
+    EXPECT_EQ(record.size, kSourceModelDataSize);
+    EXPECT_EQ(record.supplied_by_application, 0);
+    EXPECT_EQ(record.checksum_at_read, expected_checksum);
+    EXPECT_EQ(record.checksum_at_release, expected_checksum);
+  }
+
+  {
+    // Empty result and no folder to read the file from: session creation fails.
+    SourceModelDataReadState read_state;
+    read_state.ep_context.payload = write_callback_state.payload;
+    try {
+      LoadWithSourceModelDataFile(plugin_ep_device, compiled_model_file, read_state);
+      FAIL() << "Session creation succeeded without the source model data file";
+    } catch (const Ort::Exception& error) {
+      EXPECT_THAT(error.what(), ::testing::HasSubstr("was not supplied by the read callback"));
+    }
+  }
+
+  {
+    // A callback error fails session creation, even though the file is on disk.
+    SourceModelDataReadState read_state;
+    read_state.ep_context.payload = write_callback_state.payload;
+    read_state.fail_source_model_data_read = true;
+    try {
+      LoadWithSourceModelDataFile(plugin_ep_device, compiled_model_file, read_state, data_folder);
+      FAIL() << "Session creation succeeded although the read callback failed";
+    } catch (const Ort::Exception& error) {
+      EXPECT_THAT(error.what(), ::testing::HasSubstr("failed to read the source model data file"));
+    }
+  }
 }
 
 TEST(OrtEpLibrary, PluginEp_BooleanConfigRejectsInvalidValues) {

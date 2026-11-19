@@ -29,6 +29,12 @@ inline constexpr const char* kExampleEpTestWeightlessSupport = "ep.example_ep.te
 // the EP doesn't actually load the referenced data.
 inline constexpr const char* kExampleEpTestWeightlessDropInitializers =
     "ep.example_ep.test_weightless_drop_initializers";
+// Declared location of a source model external data file (e.g., "weights/model.data"). When set, the EP reads that file
+// while it imports an EPContext node, as an EP that rebuilds the source model of a weightless EPContext model does: via
+// the EPContext read callback, or, if the callback doesn't supply it, from the source model's directory
+// ("session.model_external_initializers_file_folder_path", or the directory of "ep.context_source_model_path"). The EP
+// reads the file once per session and keeps it until it's released.
+inline constexpr const char* kExampleEpTestSourceModelDataFile = "ep.example_ep.test_source_model_data_file";
 
 extern "C" {
 EXPORT_SYMBOL void ExampleEpTestHooks_ResetSyncCount();
@@ -54,6 +60,13 @@ EXPORT_SYMBOL void ExampleEpTestHooks_GetWeightlessSourceModelBuffer(const void*
 // Value the factory reports in the older "weightless_support" EP metadata entry for EP devices created afterwards,
 // i.e., when the library is registered. nullptr restores the default value ("all").
 EXPORT_SYMBOL void ExampleEpTestHooks_SetLegacyWeightlessSupportMetadata(const char* value);
+// Source model data file the EP read for kExampleEpTestSourceModelDataFile since the last reset: the number of reads,
+// the address and size of the data the EP used, whether the read callback supplied it (1) or the EP read the file (0),
+// and an FNV-1a checksum of the data when the EP read it and when the EP was released (0 if not released yet).
+EXPORT_SYMBOL void ExampleEpTestHooks_ResetSourceModelDataFile();
+EXPORT_SYMBOL void ExampleEpTestHooks_GetSourceModelDataFile(uint64_t* read_count, const void** data, size_t* size,
+                                                             int* supplied_by_application, uint64_t* checksum_at_read,
+                                                             uint64_t* checksum_at_release);
 }
 
 // Internal to the library; not exported.
@@ -64,4 +77,7 @@ void RecordEnableWeightlessOption(int value);
 void RecordEnableWeightlessEpContextNodesOption(int value);
 void RecordSavedInitializer();
 void RecordWeightlessSourceModelBuffer(const void* data, size_t length);
+uint64_t SourceModelDataChecksum(const void* data, size_t size);
+void RecordSourceModelDataFileRead(const void* data, size_t size, bool supplied_by_application);
+void RecordSourceModelDataFileRelease(const void* data, size_t size);
 const char* GetLegacyWeightlessSupportMetadata();

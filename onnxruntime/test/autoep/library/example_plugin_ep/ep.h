@@ -3,8 +3,12 @@
 
 #pragma once
 
+#include <filesystem>
+#include <optional>
+
 #include <gsl/span>
 
+#include "../ep_context_data_utils.h"
 #include "../plugin_ep_utils.h"
 #include "onnxruntime_cxx_api.h"
 
@@ -81,6 +85,10 @@ class ExampleEp : public OrtEp, public ApiPtrs {
     bool test_read_ep_context_during_compile = false;
     // External-only float32 Mul fixture: writes a versioned marker and restores a kernel only for that marker.
     bool test_execute_ep_context = false;
+    // Test-only: declared location of a source model data file to read when importing an EPContext node (see
+    // kExampleEpTestSourceModelDataFile), and the directory to read it from if the read callback doesn't supply it.
+    std::string test_source_model_data_file;
+    std::filesystem::path source_model_data_dir;
     std::string ep_context_output_model_path;
     // Other EP configs (typically extracted from OrtSessionOptions or OrtHardwareDevice(s))
   };
@@ -88,7 +96,7 @@ class ExampleEp : public OrtEp, public ApiPtrs {
   ExampleEp(ExampleEpFactory& factory, const std::string& name, const Config& config, const OrtLogger& logger,
             Ort::EpContextConfig ep_context_config);
 
-  ~ExampleEp() = default;
+  ~ExampleEp();
 
   std::unordered_map<std::string, std::unique_ptr<MulKernel>>& MulKernels() {
     return mul_kernels_;
@@ -150,6 +158,10 @@ class ExampleEp : public OrtEp, public ApiPtrs {
   //   folding).
   OrtStatus* TrySaveConstantInitializer(Ort::ConstValueInfo maybe_initializer);
 
+  // Reads the source model data file named by Config::test_source_model_data_file, once per session, as an EP that
+  // rebuilds the source model of a weightless EPContext model does.
+  OrtStatus* ReadSourceModelDataFileOnce();
+
   ExampleEpFactory& factory_;
   std::string name_;
   Config config_{};
@@ -158,5 +170,8 @@ class ExampleEp : public OrtEp, public ApiPtrs {
   std::unordered_map<std::string, std::unique_ptr<MulKernel>> mul_kernels_;
   std::unordered_map<std::string, std::unique_ptr<EpContextKernel>> ep_context_kernels_;
   std::unordered_map<std::string, FloatInitializer> float_initializers_;
+  // Source model data file read by ReadSourceModelDataFileOnce(). If the application supplied it with the read
+  // callback, this refers to application-owned memory, which the EP never frees.
+  std::optional<ep_context_data_utils::SourceModelDataFile> source_model_data_file_;
   std::string compatibility_info_;  // Cached compatibility string returned by GetCompiledModelCompatibilityInfo
 };

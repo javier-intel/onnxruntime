@@ -72,9 +72,15 @@ OrtStatus* ORT_API_CALL ExampleExternalResourceImporter::ImportMemoryImpl(
     return impl.apis_.ort_api.CreateStatus(ORT_FAIL, "Failed to allocate external memory handle");
   }
 
-  // Allocate simulated memory (using CPU memory for the example)
-  size_t effective_size = desc->size_bytes - desc->offset_bytes;
-  handle->simulated_ptr = std::make_unique<char[]>(effective_size);
+  if (desc->handle_type == ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION) {
+    // Host memory is accessible to this example EP's (CPU) device in place, as it is to a UMA device: no copy. The
+    // application keeps owning it.
+    handle->host_ptr = static_cast<char*>(desc->native_handle) + desc->offset_bytes;
+  } else {
+    // Allocate simulated memory (using CPU memory for the example)
+    size_t effective_size = desc->size_bytes - desc->offset_bytes;
+    handle->simulated_ptr = std::make_unique<char[]>(effective_size);
+  }
 
   *out_handle = handle;
   return nullptr;
@@ -109,7 +115,7 @@ OrtStatus* ORT_API_CALL ExampleExternalResourceImporter::CreateTensorFromMemoryI
   auto* handle = static_cast<const ExampleExternalMemoryHandle*>(mem_handle);
 
   // Calculate the data pointer with tensor offset
-  void* data_ptr = handle->simulated_ptr.get() + tensor_desc->offset_bytes;
+  void* data_ptr = handle->mapped_ptr() + tensor_desc->offset_bytes;
 
   // For the example EP, we use CPU memory info since we're simulating with CPU memory
   // In a real implementation, you would use the appropriate GPU memory info

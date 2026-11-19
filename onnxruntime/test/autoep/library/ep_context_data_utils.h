@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +43,9 @@
  *    buffer that avoids copying large data.
  *  - WriteEpContextDataWithFileFallback(api, config, ...): writes via an application-supplied OrtWriteNamedBufferFunc
  *    or the file fallback.
+ *  - ReadSourceModelDataFile(api, config, location, fallback_dir, out): reads one of the source model's external data
+ *    files while importing a weightless EPContext model, via the read callback (application-owned memory, never
+ *    freed by the EP) or the file fallback.
  *
  * The other functions are lower-level building blocks. Production EPs should additionally apply their own sandboxing,
  * size limits, and path policies; see the per-function notes on how untrusted, model-derived names are treated.
@@ -751,6 +755,162 @@ inline OrtStatus* WriteEpContextDataWithFileFallback(
     const char* file_name, const OrtGraph* graph,
     const void* buffer, size_t buffer_size) {
   return WriteEpContextDataWithFileFallback(api, ep_context_config, file_name, file_name, graph, buffer, buffer_size);
+}
+
+/**
+ * \brief One of the source model's external data files, read by ReadSourceModelDataFile().
+ *
+ * If the application supplied the file with the read callback, this is a non-owning view of application-owned memory:
+ * the EP never frees it, and the application keeps it valid while the session may use it. Otherwise it owns the bytes
+ * read from the file system.
+ */
+class SourceModelDataFile {
+ public:
+  SourceModelDataFile() = default;
+  SourceModelDataFile(SourceModelDataFile&&) noexcept = default;
+  SourceModelDataFile& operator=(SourceModelDataFile&&) noexcept = default;
+  SourceModelDataFile(const SourceModelDataFile&) = delete;
+  SourceModelDataFile& operator=(const SourceModelDataFile&) = delete;
+
+  const void* data() const noexcept { return supplied_by_application_ ? application_data_ : file_bytes_.data(); }
+  size_t size() const noexcept { return supplied_by_application_ ? application_data_size_ : file_bytes_.size(); }
+  bool supplied_by_application() const noexcept { return supplied_by_application_; }
+
+  void Reset() noexcept {
+    application_data_ = nullptr;
+    application_data_size_ = 0;
+    supplied_by_application_ = false;
+    file_bytes_.clear();
+  }
+
+  // Refers to application-owned memory without taking ownership.
+  void SetApplicationData(const void* data, size_t size) noexcept {
+    Reset();
+    application_data_ = data;
+    application_data_size_ = size;
+    supplied_by_application_ = true;
+  }
+
+  void SetFileBytes(std::vector<char>&& bytes) noexcept {
+    Reset();
+    file_bytes_ = std::move(bytes);
+  }
+
+ private:
+  const void* application_data_ = nullptr;
+  size_t application_data_size_ = 0;
+  bool supplied_by_application_ = false;
+  std::vector<char> file_bytes_;
+};
+
+// Low-level overload that takes the read callback and its state directly; see the overload below.
+inline OrtStatus* ReadSourceModelDataFile(const OrtApi& api, OrtReadNamedBufferFunc read_func, void* read_state,
+                                          const char* location, const std::filesystem::path& fallback_dir,
+                                          SourceModelDataFile& out,
+                                          size_t max_data_size = std::numeric_limits<size_t>::max()) {
+  out.Reset();
+
+  if (location == nullptr || location[0] == '\0') {
+    return api.CreateStatus(ORT_INVALID_ARGUMENT, "Source model data file location must not be empty");
+  }
+
+  // The name passed to the callback is the declared location, normalized with '/' separators.
+  std::string name{location};
+  std::replace(name.begin(), name.end(), '\\', '/');
+
+  std::filesystem::path relative_path;
+  RETURN_IF_ERROR(Utf8Path(api, name.c_str(), relative_path));
+  if (HasAbsoluteOrRootedPath(relative_path)) {
+    return api.CreateStatus(ORT_INVALID_ARGUMENT, "Source model data file location must not be absolute or rooted");
+  }
+
+  if (read_func != nullptr) {
+    // The allocator is not used for source model data files: the application returns memory it owns. It's passed
+    // because the callback signature requires one.
+    OrtAllocator* allocator = nullptr;
+    RETURN_IF_ERROR(api.GetAllocatorWithDefaultOptions(&allocator));
+
+    void* buffer = nullptr;
+    size_t buffer_size = 0;
+    RETURN_IF_ERROR(read_func(read_state, name.c_str(), allocator, &buffer, &buffer_size));
+    if (buffer_size != 0) {
+      if (buffer == nullptr) {
+        return api.CreateStatus(ORT_FAIL,
+                                "OrtReadNamedBufferFunc returned a null buffer for a non-empty source model data file");
+      }
+      if (buffer_size > max_data_size) {
+        return api.CreateStatus(ORT_INVALID_ARGUMENT, "Source model data file exceeds the configured maximum size");
+      }
+      // Application-owned memory: keep a view, never free it.
+      out.SetApplicationData(buffer, buffer_size);
+      return nullptr;
+    }
+    // An empty result means the application doesn't supply the file: read it from the file system.
+  }
+
+  if (fallback_dir.empty()) {
+    const std::string message = "Source model data file '" + name +
+                                "' was not supplied by the read callback and there is no directory to read it from";
+    return api.CreateStatus(ORT_INVALID_ARGUMENT, message.c_str());
+  }
+
+  std::filesystem::path data_path;
+  if (!IsResolvedPathWithinBase(fallback_dir, fallback_dir / relative_path, data_path)) {
+    return api.CreateStatus(ORT_INVALID_ARGUMENT,
+                            "Source model data file location must resolve to a path within the source model directory");
+  }
+  RETURN_IF_ERROR(EnsureRegularFileForRead(api, data_path));
+
+  std::error_code ec;
+  const std::uintmax_t file_size = std::filesystem::file_size(data_path, ec);
+  if (ec || file_size > static_cast<std::uintmax_t>(max_data_size)) {
+    return api.CreateStatus(ORT_INVALID_ARGUMENT, "Source model data file can't be read or exceeds the maximum size");
+  }
+
+  std::ifstream input_stream(data_path, std::ios::binary);
+  std::vector<char> bytes{std::istreambuf_iterator<char>{input_stream}, std::istreambuf_iterator<char>{}};
+  if (!input_stream && !input_stream.eof()) {
+    const std::string message = "Failed to read source model data file: " + PathToUtf8StringForMessage(data_path);
+    return api.CreateStatus(ORT_FAIL, message.c_str());
+  }
+  out.SetFileBytes(std::move(bytes));
+  return nullptr;
+}
+
+/**
+ * \brief Read one of the source model's external data files while importing a weightless EPContext model.
+ *
+ * If `ep_context_config` carries a read callback, it is called with the file's declared `location`, normalized with
+ * '/' separators. A non-empty result is application-owned memory that `out` refers to without taking ownership: the
+ * EP never frees it. The allocator passed to the callback is not used for these reads. An empty result means the
+ * application doesn't supply the file, and it is read from `fallback_dir` (the source model's directory, or
+ * "session.model_external_initializers_file_folder_path"), as it is when no callback is configured.
+ *
+ * \param api The OrtApi.
+ * \param ep_context_config EPContext config carrying the optional read callback; may be null.
+ * \param location The file's 'location' as declared in the source model's external_data entries. Must be relative.
+ * \param fallback_dir Directory to read the file from when the callback doesn't supply it. If empty, the file must be
+ *                     supplied by the callback.
+ * \param out Reset first; receives the data on success.
+ * \param max_data_size EP-selected maximum file size.
+ * \return nullptr on success, or an OrtStatus* error owned by the caller. A callback error is returned as is.
+ */
+inline OrtStatus* ReadSourceModelDataFile(const OrtApi& api, const OrtEpContextConfig* ep_context_config,
+                                          const char* location, const std::filesystem::path& fallback_dir,
+                                          SourceModelDataFile& out,
+                                          size_t max_data_size = std::numeric_limits<size_t>::max()) {
+  out.Reset();
+
+  OrtReadNamedBufferFunc read_func = nullptr;
+  void* read_state = nullptr;
+  if (ep_context_config != nullptr) {
+    const OrtEpApi* ep_api = api.GetEpApi();
+    if (ep_api == nullptr) {
+      return api.CreateStatus(ORT_NOT_IMPLEMENTED, "OrtEpApi is not available");
+    }
+    RETURN_IF_ERROR(ep_api->EpContextConfigGetEpContextDataReadFunc(ep_context_config, &read_func, &read_state));
+  }
+  return ReadSourceModelDataFile(api, read_func, read_state, location, fallback_dir, out, max_data_size);
 }
 
 }  // namespace ep_context_data_utils

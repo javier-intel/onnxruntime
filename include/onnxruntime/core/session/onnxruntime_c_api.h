@@ -621,16 +621,30 @@ typedef OrtStatus*(ORT_API_CALL* OrtWriteNamedBufferFunc)(_In_ void* state,
 
 /** \brief Function called to read named binary data.
  *
- * The callback must allocate the returned buffer with `allocator`. The consumer frees it with the same allocator.
- * ORT does not serialize calls made by different EP instances or worker threads.
+ * The callback reads two kinds of data, which differ in who owns the returned memory:
+ * - EPContext data (the `ep_cache_context` of an EPContext node whose data is in a separate file): the callback must
+ *   allocate the returned buffer with `allocator`. The consumer frees it with the same allocator.
+ * - The source model's external data files, which an EP may read while it imports a weightless EPContext model (see
+ *   OrtApi::SessionOptionsSetEpContextDataReadFunc). `name` is the file's 'location' as declared in the source model,
+ *   relative to the source model's directory, with '/' separators (e.g., "weights/model.data"). The callback returns
+ *   the whole file, in memory the application owns: the consumer never frees it, and `allocator` is not used. The
+ *   memory must stay valid while the session may use it, which can extend to the last inference. An empty result
+ *   (`*buffer` NULL and `*data_size` 0) means the application doesn't supply the file, and the EP reads it from the
+ *   file system. This ownership rule is provisional and may change in a future version.
+ *
+ * The application must keep the names of the source model's data files distinct from the EPContext data names of the
+ * same model. ORT does not serialize calls made by different EP instances or worker threads.
  *
  * \param[in] state Application-owned state. It must remain valid while the callback may be invoked and must be
- *                  synchronized by the application if calls can be concurrent.
+ *                  synchronized by the application if calls can be concurrent. It can hold the application's record
+ *                  of the source model data buffers it returned.
  * \param[in] name Null-terminated UTF-8 logical data identifier.
- * \param[in] allocator Allocator that must be used for the output buffer.
- * \param[out] buffer Allocated output buffer, or NULL for an empty payload.
+ * \param[in] allocator Allocator that must be used for the output buffer of EPContext data. Not used for source model
+ *                      data files.
+ * \param[out] buffer Output buffer, or NULL for an empty result.
  * \param[out] data_size Number of bytes in `buffer`.
- * \return nullptr on success, or an OrtStatus* describing the failure. ORT releases a non-null returned status.
+ * \return nullptr on success, or an OrtStatus* describing the failure. A non-null status fails session creation. ORT
+ *         releases a non-null returned status.
  *
  * \since Version 1.31.
  */
@@ -648,7 +662,9 @@ typedef enum OrtEpContextDataCallbackSupportFlags {
   /** The EP does not support application-managed external EPContext data. */
   OrtEpContextDataCallbackSupportFlags_NONE = 0,
 
-  /** The EP will use the read callback if one is configured. */
+  /** The EP will use the read callback if one is configured. While it imports a weightless EPContext model, the EP may
+   *  also call the read callback to read the source model's external data files (see
+   *  OrtApi::SessionOptionsSetEpContextDataReadFunc). */
   OrtEpContextDataCallbackSupportFlags_READ = 1 << 0,
 
   /** The EP will use the write callback if one is configured. */
@@ -7744,6 +7760,45 @@ struct OrtApi {
    * callback is not used for EPContext nodes whose data is embedded in the ONNX model. Passing NULL clears the
    * callback and its state. If an external EPContext node is assigned to an EP that does not advertise READ support,
    * session initialization fails before that EP's Compile() call.
+   *
+   * For EPContext data, the callback allocates the returned buffer with the `allocator` it receives, and the consumer
+   * frees it with that allocator.
+   *
+   * <b>Source model data files.</b> ORT itself doesn't call the callback for these. An EP that supports
+   * OrtEpContextDataCallbackSupportFlags_READ may also call it while it imports a weightless EPContext model, to read
+   * the external data files of the source model it rebuilds to resolve the weights left out of its compiled data.
+   * Together with OrtApi::SessionOptionsSetWeightlessSourceModelBuffer(), this lets an application import a weightless
+   * EPContext model without any weights on disk, e.g., when it keeps them in memory or encrypted.
+   * - `name` is the file's 'location' as declared in the source model's `external_data` entries, relative to the
+   *   source model's directory, normalized with '/' separators (e.g., "weights/model.data").
+   * - The callback returns the whole file. The EP finds each initializer at its declared offset.
+   * - An empty result (`*buffer` NULL and `*data_size` 0) means the application doesn't supply that file: the EP reads
+   *   it from the file system (the source model's directory, or
+   *   "session.model_external_initializers_file_folder_path"). For EPContext data, an empty result keeps its meaning.
+   * - Returning an error status fails session creation.
+   * - The EP may call the callback once per file per compiled partition, or cache the result for the session.
+   * - The application must ensure these names don't collide with the EPContext data names (`ep_cache_context` of the
+   *   EPContext nodes) of the same model: name them distinctly, or place the data files in a subdirectory.
+   *
+   * <b>Ownership of source model data files.</b> This rule is provisional and may change in a future version. When
+   * the callback is asked for a source model data file, it returns memory the application owns, and the consumer
+   * never frees it. The `allocator` argument is not used for these reads. The memory must stay valid while the
+   * session may use it, which can extend to the last inference. `state` can hold the application's record of the
+   * buffers it returned.
+   *
+   * To avoid a copy into device-visible memory, the application can import the memory into the calling EP:
+   * - import it with OrtInteropApi::ImportMemory() (ORT_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION), using an
+   *   importer created for the session's EP device (OrtInteropApi::CreateExternalResourceImporterForDevice());
+   * - create a tensor over it with OrtInteropApi::CreateTensorFromMemory();
+   * - return that tensor's data pointer (OrtApi::GetTensorMutableData()) and size. This is the address that results
+   *   from the import, which can differ from the application's host pointer, so the tensor is required.
+   *
+   * After the last inference, the application releases the tensor (OrtApi::ReleaseValue()) and the memory handle
+   * (OrtInteropApi::ReleaseExternalMemoryHandle()), before or after releasing the session, and frees its host memory
+   * last. Releasing an import doesn't free the host memory. Host memory imports require the address and size
+   * alignment the EP documents (page-aligned for the OpenVINO EP), and are supported on devices whose memory the host
+   * can access (UMA devices such as NPUs and integrated GPUs). The import must be made with an importer for the EP
+   * device that calls the callback.
    *
    * \param[in] options Session options used to create the session and execution providers.
    * \param[in] read_func Read callback, or NULL to clear a previously registered callback.

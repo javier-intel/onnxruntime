@@ -16,6 +16,8 @@ VERS_1.0.0 {
   ExampleEpTestHooks_ResetWeightlessSourceModelBuffer;
   ExampleEpTestHooks_GetWeightlessSourceModelBuffer;
   ExampleEpTestHooks_SetLegacyWeightlessSupportMetadata;
+  ExampleEpTestHooks_ResetSourceModelDataFile;
+  ExampleEpTestHooks_GetSourceModelDataFile;
  local:
     *;
 };

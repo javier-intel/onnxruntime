@@ -52,6 +52,10 @@ struct Utils {
     using ResetWeightlessSourceModelBufferFn = void (*)();
     using GetWeightlessSourceModelBufferFn = void (*)(const void** data, size_t* length);
     using SetLegacyWeightlessSupportMetadataFn = void (*)(const char* value);
+    using ResetSourceModelDataFileFn = void (*)();
+    using GetSourceModelDataFileFn = void (*)(uint64_t* read_count, const void** data, size_t* size,
+                                              int* supplied_by_application, uint64_t* checksum_at_read,
+                                              uint64_t* checksum_at_release);
 
     ResetSyncCountFn reset_sync_count{};
     GetSyncCountFn get_sync_count{};
@@ -67,6 +71,8 @@ struct Utils {
     ResetWeightlessSourceModelBufferFn reset_weightless_source_model_buffer{};
     GetWeightlessSourceModelBufferFn get_weightless_source_model_buffer{};
     SetLegacyWeightlessSupportMetadataFn set_legacy_weightless_support_metadata{};
+    ResetSourceModelDataFileFn reset_source_model_data_file{};
+    GetSourceModelDataFileFn get_source_model_data_file{};
   };
 
   using LoadExampleEpHooksPtr = std::unique_ptr<ExampleEpHooks, std::function<void(ExampleEpHooks*)>>;

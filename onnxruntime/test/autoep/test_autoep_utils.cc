@@ -112,6 +112,10 @@ void Utils::LoadExampleEpHooks(const ExamplePluginInfo& ep_info,
   hooks.set_legacy_weightless_support_metadata =
       reinterpret_cast<ExampleEpHooks::SetLegacyWeightlessSupportMetadataFn>(
           GetProcAddress(lib, "ExampleEpTestHooks_SetLegacyWeightlessSupportMetadata"));
+  hooks.reset_source_model_data_file = reinterpret_cast<ExampleEpHooks::ResetSourceModelDataFileFn>(
+      GetProcAddress(lib, "ExampleEpTestHooks_ResetSourceModelDataFile"));
+  hooks.get_source_model_data_file = reinterpret_cast<ExampleEpHooks::GetSourceModelDataFileFn>(
+      GetProcAddress(lib, "ExampleEpTestHooks_GetSourceModelDataFile"));
 #else
   void* lib = dlopen(ep_info.library_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
   ASSERT_NE(lib, nullptr);
@@ -150,6 +154,10 @@ void Utils::LoadExampleEpHooks(const ExamplePluginInfo& ep_info,
   hooks.set_legacy_weightless_support_metadata =
       reinterpret_cast<Utils::ExampleEpHooks::SetLegacyWeightlessSupportMetadataFn>(
           dlsym(lib, "ExampleEpTestHooks_SetLegacyWeightlessSupportMetadata"));
+  hooks.reset_source_model_data_file = reinterpret_cast<Utils::ExampleEpHooks::ResetSourceModelDataFileFn>(
+      dlsym(lib, "ExampleEpTestHooks_ResetSourceModelDataFile"));
+  hooks.get_source_model_data_file = reinterpret_cast<Utils::ExampleEpHooks::GetSourceModelDataFileFn>(
+      dlsym(lib, "ExampleEpTestHooks_GetSourceModelDataFile"));
 #endif
 
   example_ep_hooks = LoadExampleEpHooksPtr(

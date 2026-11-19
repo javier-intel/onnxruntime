@@ -2133,6 +2133,10 @@ struct OrtEpApi {
 
   /** \brief Get the EPContext data read callback and application state.
    *
+   * An EP that supports OrtEpContextDataCallbackSupportFlags_READ may also call the callback while it imports a
+   * weightless EPContext model, to read the source model's external data files. For those files the callback returns
+   * application-owned memory, which the EP must not free. See OrtApi::SessionOptionsSetEpContextDataReadFunc.
+   *
    * If no callback is configured, both outputs are set to NULL. On failure, both outputs are unchanged.
    * The returned state is application-owned and remains
    * subject to the lifetime and synchronization requirements documented by SessionOptionsSetEpContextDataReadFunc.
